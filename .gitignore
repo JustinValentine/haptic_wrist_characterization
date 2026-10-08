@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.png
 *.pdf
+.DS_Store
+
+# Simulated runs are reproducible (python <experiment>.py --sim); real runs in
+# data/<experiment>/<timestamp>/ are kept. 1 kHz runs are tens of MB each, so
+# consider archiving raw data outside git if the repository grows.
+data/*/*_sim/

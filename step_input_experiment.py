@@ -1,159 +1,102 @@
-import asyncio
-from datetime import datetime, timezone
+"""Step-input identification of joint inertia, viscous damping, and Coulomb friction.
+
+With a pure P controller (Kd = 0) the joint behaves as a spring-mass system
+with friction:
+
+    J th'' + b th' + fc sign(th') = Kp (th_cmd - th)
+
+Each step makes the joint ring down. step_input_experiment_analysis.py
+identifies J, b, and fc from the sequence of turning points. Several step
+sizes are used because Coulomb friction makes the decay amplitude-dependent,
+which is what separates it from viscous damping.
+
+Run:  python step_input_experiment.py [--sim] [--quick]
+"""
 import math
-import time
-import moteus
-import pandas as pd
+from dataclasses import asdict, dataclass
 
-from experiment_common import (
-    MOTEUS_OUTPUT_RATIO_NOTE,
-    configure_position_pid,
-    joint_gains_to_moteus,
-    joint_degrees_to_motor_revs,
-    make_query_resolution,
-    motor_revs_to_joint_degrees,
-    motor_torque_to_joint_torque,
-    motor_velocity_to_joint_deg_s,
-    state_register_value,
-    state_value,
-    write_json,
-)
+import device_config
+from experiment_common import (MoteusSession, confirm, describe_plan, hold, make_arg_parser,
+                               min_jerk_move, run_cli)
 
-# --- USER CONFIGURATION ---
-GEAR_RATIO = 10.0       # Cable reduction: motor revs per joint/load rev
-KP_JOINT_NM_RAD = 15.0  # Desired load-side stiffness (Nm/rad)
-STEP_SIZE_DEG = 20.0    # Peak-to-peak joint step size in degrees
-DURATION = 4.0          # Seconds per step (allow settling)
-SAMPLE_PERIOD = 0.002   # 500 Hz command/logging target
-PERSIST_MOTEUS_CONFIG = False
-DATA_FILE = 'step_response_data.csv'
-METADATA_FILE = 'step_response_collection_metadata.json'
-
-# Calculate Moteus Gains
-# Kp_motor (Nm/motor-rev) = Kp_joint (Nm/rad) * (2pi / N^2)
-KP_MOTEUS, KD_MOTEUS = joint_gains_to_moteus(KP_JOINT_NM_RAD, 0.0, GEAR_RATIO)
-
-async def run_experiment():
-    qr = make_query_resolution()
-    c = moteus.Controller(id=1, query_resolution=qr)
-    await c.set_stop()
-    data = []
-    verified = {}
-    start_pos_rev = math.nan
-    run_started_monotonic = time.monotonic()
-    run_started_utc = datetime.now(timezone.utc).isoformat()
-
-    try:
-        verified = await configure_position_pid(
-            c, KP_MOTEUS, KD_MOTEUS, ki=0.0, persist=PERSIST_MOTEUS_CONFIG
-        )
-
-        # Read initial position to avoid a violent jump at start.
-        state = await c.set_position(position=math.nan, query=True)
-        start_pos_rev = state_value(state, moteus.Register.POSITION)
-
-        half_step_rev = joint_degrees_to_motor_revs(STEP_SIZE_DEG / 2.0, GEAR_RATIO)
-        pos_low = start_pos_rev - half_step_rev
-        pos_high = start_pos_rev + half_step_rev
-
-        print("Starting Step Input Experiment.")
-        print(MOTEUS_OUTPUT_RATIO_NOTE)
-        print(f"Joint Kp: {KP_JOINT_NM_RAD} Nm/rad")
-        print(f"Moteus PID: Kp={KP_MOTEUS:.6g} Nm/rev, Kd={KD_MOTEUS:.6g} Nm/(rev/s)")
-        print(f"Verified config: {verified}")
-        print("WARNING: System is intentionally underdamped. Expect oscillations.")
-
-        start_time = time.monotonic()
-
-        # Sequence: Neutral -> Low -> High -> Low -> High.
-        targets = [
-            (0.0, start_pos_rev),
-            (-STEP_SIZE_DEG / 2.0, pos_low),
-            (STEP_SIZE_DEG / 2.0, pos_high),
-            (-STEP_SIZE_DEG / 2.0, pos_low),
-            (STEP_SIZE_DEG / 2.0, pos_high),
-        ]
-
-        sample_index = 0
-        for segment, (target_joint_deg, target_motor_rev) in enumerate(targets):
-            step_start = time.monotonic()
-            while (time.monotonic() - step_start) < DURATION:
-                t_now = time.monotonic() - start_time
-
-                # Pure P-control: Kd is configured to zero and kd_scale is held at zero.
-                state = await c.set_position(
-                    position=target_motor_rev,
-                    kp_scale=1.0,
-                    kd_scale=0.0,
-                    query=True
-                )
-
-                motor_pos_rev = state_value(state, moteus.Register.POSITION)
-                motor_vel_rev_s = state_value(state, moteus.Register.VELOCITY)
-                motor_torque_nm = state_value(state, moteus.Register.TORQUE)
-                rel_motor_rev = motor_pos_rev - start_pos_rev
-
-                data.append({
-                    'sample_index': sample_index,
-                    'time': t_now,
-                    'segment': segment,
-                    'cmd_pos_rev': target_motor_rev,
-                    'cmd_joint_deg': target_joint_deg,
-                    'motor_pos_rev': motor_pos_rev,
-                    'motor_pos_rel_rev': rel_motor_rev,
-                    'joint_pos_deg': motor_revs_to_joint_degrees(rel_motor_rev, GEAR_RATIO),
-                    'motor_vel_rev_s': motor_vel_rev_s,
-                    'joint_vel_deg_s': motor_velocity_to_joint_deg_s(motor_vel_rev_s, GEAR_RATIO),
-                    'motor_torque_nm': motor_torque_nm,
-                    'joint_torque_nm': motor_torque_to_joint_torque(motor_torque_nm, GEAR_RATIO),
-                    'gear_ratio': GEAR_RATIO,
-                    'kp_joint_nm_rad': KP_JOINT_NM_RAD,
-                    'kp_moteus_nm_rev': KP_MOTEUS,
-                    'kd_moteus_nm_rev_s': KD_MOTEUS,
-                    'mode': state_register_value(state, moteus.Register, "MODE"),
-                    'fault': state_register_value(state, moteus.Register, "FAULT"),
-                })
-                sample_index += 1
-
-                await asyncio.sleep(SAMPLE_PERIOD)
-
-    finally:
-        await c.set_stop()
-        if data:
-            df = pd.DataFrame(data)
-            df.to_csv(DATA_FILE, index=False)
-            write_json(METADATA_FILE, {
-                'experiment': 'step_input_experiment.py',
-                'data_file': DATA_FILE,
-                'run_started_utc': run_started_utc,
-                'run_duration_s': time.monotonic() - run_started_monotonic,
-                'num_samples': len(data),
-                'measured_sample_frequency_hz': measured_sample_frequency(data),
-                'moteus_controller_id': 1,
-                'moteus_rotor_to_output_ratio_assumption': 1,
-                'external_gear_ratio': GEAR_RATIO,
-                'start_pos_rev': start_pos_rev,
-                'kp_joint_nm_rad': KP_JOINT_NM_RAD,
-                'kd_joint_nms_rad': 0.0,
-                'kp_moteus_nm_rev': KP_MOTEUS,
-                'kd_moteus_nm_rev_s': KD_MOTEUS,
-                'step_size_deg': STEP_SIZE_DEG,
-                'duration_per_step_s': DURATION,
-                'sample_period_commanded_s': SAMPLE_PERIOD,
-                'persist_moteus_config': PERSIST_MOTEUS_CONFIG,
-                'verified_moteus_pid_config': verified,
-            })
-            print(f"Data saved to '{DATA_FILE}'")
-            print(f"Collection metadata saved to '{METADATA_FILE}'")
+EXPERIMENT = 'step_response'
 
 
-def measured_sample_frequency(data):
-    if len(data) < 2:
-        return math.nan
-    duration = data[-1]['time'] - data[0]['time']
-    if duration <= 0:
-        return math.nan
-    return (len(data) - 1) / duration
+# --- USER CONFIGURATION -----------------------------------------------------------
+@dataclass
+class StepConfig:
+    kp_joint_nm_rad: float = 15.0           # Soft P-only spring (Kd = 0)
+    step_sizes_deg: tuple = (5.0, 10.0, 20.0)
+    steps_per_size: int = 6                 # Alternating up/down steps per size
+    center_deg: float = 0.0                 # Steps are centered here
+    hold_s: float = 3.0                     # Per step; must cover the full ring-down
+    settle_s: float = 2.0                   # Before each block of steps
+    reposition_speed_deg_s: float = 20.0
+    sample_rate_hz: float = 1000.0
+
+
+QUICK = dict(step_sizes_deg=(10.0, 20.0), steps_per_size=4, hold_s=2.0, settle_s=1.0)
+
+
+def build_segments(cfg):
+    p_only = dict(kd_scale=0.0)
+    segments = [hold(cfg.settle_s, 0.0, phase='settle', **p_only)]
+    position = 0.0
+    step_id = 0
+    for size in cfg.step_sizes_deg:
+        low = cfg.center_deg - size / 2.0
+        high = cfg.center_deg + size / 2.0
+        segments.append(min_jerk_move(position, low, cfg.reposition_speed_deg_s, **p_only))
+        segments.append(hold(cfg.settle_s, low, phase='settle', **p_only))
+        position = low
+        for _ in range(cfg.steps_per_size):
+            target = high if position == low else low
+            segments.append(hold(cfg.hold_s, target, phase='step', info={
+                'step_id': step_id,
+                'step_size_deg': size,
+                'direction': 1 if target > position else -1,
+                'prev_target_deg': position,
+            }, **p_only))
+            position = target
+            step_id += 1
+    segments.append(min_jerk_move(position, 0.0, cfg.reposition_speed_deg_s, **p_only))
+    segments.append(hold(1.0, 0.0, phase='settle', **p_only))
+    return segments
+
+
+def plan_warnings(cfg):
+    lines = []
+    largest = max(cfg.step_sizes_deg)
+    peak_torque = cfg.kp_joint_nm_rad * math.radians(largest)
+    if peak_torque > 0.9 * device_config.MAX_JOINT_TORQUE_NM:
+        raise SystemExit(f'Kp x largest step = {peak_torque:.2f} N m saturates the torque cap; '
+                         'reduce kp_joint_nm_rad or the step size.')
+    # A lightly damped spring can overshoot by nearly a full step.
+    reach = abs(cfg.center_deg) + 1.5 * largest
+    lo, hi = device_config.JOINT_LIMITS_DEG
+    if reach > min(abs(lo), abs(hi)):
+        raise SystemExit(f'Steps may reach {reach:.0f} deg, beyond JOINT_LIMITS_DEG {lo, hi}.')
+    j = device_config.NOMINAL_JOINT_INERTIA_KG_M2
+    fn = math.sqrt(cfg.kp_joint_nm_rad / j) / (2 * math.pi)
+    lines.append(f'  Peak spring torque {peak_torque:.2f} N m; expected ringing ~{fn:.1f} Hz '
+                 f'(nominal J = {j} kg m^2).')
+    lines.append('  The joint is intentionally underdamped and will oscillate.')
+    return lines
+
+
+async def main(args):
+    cfg = StepConfig(**(QUICK if args.quick else {}))
+    segments = build_segments(cfg)
+    warnings = plan_warnings(cfg)
+    async with MoteusSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, 0.0,
+                             config=asdict(cfg), rate_hz=cfg.sample_rate_hz) as session:
+        confirm(args, ['Step-response identification (P-only, Kd = 0)',
+                       f'  Kp = {cfg.kp_joint_nm_rad} N m/rad, steps {cfg.step_sizes_deg} deg '
+                       f'x {cfg.steps_per_size}',
+                       *describe_plan(segments, session.max_torque_nm), *warnings])
+        await session.run(segments)
+
 
 if __name__ == '__main__':
-    asyncio.run(run_experiment())
+    parser = make_arg_parser(__doc__.splitlines()[0])
+    run_cli(lambda: main(parser.parse_args()))
