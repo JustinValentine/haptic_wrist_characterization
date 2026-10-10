@@ -44,6 +44,9 @@ class BandwidthConfig:
     crest_iterations: int = 40              # Clipping iterations to lower the crest factor
     rest_s: float = 1.0                     # Hold at zero between levels
     sample_rate_hz: float = 500.0
+    # 'pc': the p4wrist loop's PD (500 Hz, 4 ms to the motor); 'drive': the pucks'
+    # own position loops (needs drive_gain_calibration_experiment.py first).
+    loop: str = 'pc'
 
 
 QUICK = dict(amplitudes_deg=(3.0, 10.0), period_s=5.0, periods_per_level=3,
@@ -227,6 +230,14 @@ async def main(args):
     async with WristSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
+        if cfg.loop == 'drive':
+            ok, why = session.drive_loop_available()
+            if not ok:
+                raise SystemExit(f'The drive loop is not available: {why}')
+            await session.use_drive_loop(cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
+                                         velocity_feedforward=cfg.send_velocity_feedforward)
+        elif cfg.loop != 'pc':
+            raise SystemExit("loop must be 'pc' or 'drive'.")
         confirm(args, ['Closed-loop position bandwidth (periodic multisine)',
                        f'  Kp = {cfg.kp_joint_nm_rad} N m/rad, Kd = {cfg.kd_joint_nms_rad} '
                        f'N m s/rad, velocity feedforward {cfg.send_velocity_feedforward}',

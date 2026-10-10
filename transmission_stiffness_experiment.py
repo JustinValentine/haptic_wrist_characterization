@@ -34,12 +34,13 @@ SIM_PARAMS = None   # Tests inject a p4_sim.SimParams here.
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class TransmissionConfig:
-    # Peak cycle torque as a fraction of MAX_JOINT_TORQUE_NM. High, because one P4
-    # motor count is ~0.3 N m of cable torque at FE (0.0117 deg at ~1500 N m/rad).
+    # Peak cycle torque as a fraction of MAX_JOINT_TORQUE_NM. High, because the motor
+    # encoders resolve the cable's deflection coarsely: FE moves 0.006-0.012 deg per
+    # count (two encoders), ~0.15-0.3 N m of cable torque at ~1500 N m/rad.
     test_torque_fraction: float = 0.8
     cycle_period_s: float = 8.0             # One 0 -> +T -> -T -> 0 cycle (quasi-static)
     cycles: int = 3
-    # Multisine phase. Off by default on the P4 wrist: its motion is below one count
+    # Multisine phase. Off by default on the P4 wrist: its motion is about one step
     # of the 4096-count motor encoders (see plan_checks); the static loops still work.
     dynamic: bool = False
     preload_fraction: float = 0.3           # Multisine offset, fraction of the cycle torque
@@ -165,13 +166,13 @@ def plan_checks(cfg):
             print(f'NOTE: freq_max_hz limited to {cfg.sample_rate_hz / 2.5:.0f} Hz by the '
                   'sample rate.')
     k_guess = 1000.0   # N m/rad, only for the printed estimate
-    count_deg = 360.0 / (4096 * device_config.GEAR_RATIO)   # one motor count at the joint
+    count_deg = device_config.joint_count_deg()[0]   # finest joint step from the encoders
     if cfg.dynamic:
         amplitude = cfg.multisine_amplitude_fraction * test_torque
         motion_deg = math.degrees(amplitude / k_guess)
         if motion_deg < 5 * count_deg:
             print(f'WARNING: the multisine moves the joint ~{motion_deg:.4f} deg against a stiff '
-                  f'cable, {motion_deg / count_deg:.1f} motor counts ({count_deg:.4f} deg each): '
+                  f'cable, {motion_deg / count_deg:.1f} encoder steps ({count_deg:.4f} deg each): '
                   'too little for the dynamic fit. Raise multisine_amplitude_fraction or '
                   'test with an output encoder.')
     lines = [f'  Cycle torque +/-{test_torque:.2f} N m; expected deflection about '

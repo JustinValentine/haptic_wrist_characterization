@@ -26,8 +26,9 @@ class TransmissionTest(unittest.TestCase):
         meta, summary = run_with(cogging_free())
         self.assertTrue(meta['completed'])
         truth = meta['sim_truth']
-        # One encoder count at FE is ~0.3 N m of cable torque, so the loops span
-        # only ~8 counts: quantization limits the stiffness to ~15%.
+        # The encoders step FE by 0.006-0.012 deg (two motors), ~0.15-0.3 N m of cable
+        # torque, so the loops span only ~8-16 steps: quantization limits the
+        # stiffness to ~15%.
         self.assertLess(rel_err(summary['stiffness_nm_rad'], truth['transmission_stiffness']), 0.15)
         self.assertLess(abs(summary['lost_motion_deg']), 0.03)
         self.assertNotIn('dynamic_stiffness_nm_rad', summary)

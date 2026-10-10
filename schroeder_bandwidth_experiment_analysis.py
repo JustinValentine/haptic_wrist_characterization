@@ -186,16 +186,19 @@ def response_metrics(freqs, H, valid):
 
 
 # --- parametric model -------------------------------------------------------------
-def model_response(freqs, J, b, tau, kp, kd, ff, vel=None):
+def model_response(freqs, J, b, tau, kp, kd, ff, vel=None, tau_ref=0.0):
     """Closed-loop H. vel describes a velocity estimated from positions: the
     p4wrist loop differences them (half a period of lag) and filters them
-    (first order, vel['filter_hz']); None means the true velocity."""
+    (first order, vel['filter_hz']); None means the true velocity. tau_ref
+    delays the reference only (the drive loop: targets reach the drive 2 SYNC
+    periods after the command, while its own feedback is nearly immediate)."""
     s = 2j * np.pi * np.asarray(freqs, dtype=float)
     delay = np.exp(-s * tau)
     D = s
     if vel:
         D = s * np.exp(-s * vel['lag_s']) / (1.0 + s / (2.0 * np.pi * vel['filter_hz']))
-    return delay * (kp + ff * kd * s) / (J * s ** 2 + b * s + delay * (kp + kd * D))
+    return (np.exp(-s * tau_ref) * delay * (kp + ff * kd * s)
+            / (J * s ** 2 + b * s + delay * (kp + kd * D)))
 
 
 def velocity_path(run):
@@ -206,7 +209,7 @@ def velocity_path(run):
     return {'lag_s': loop['period_s'] / 2.0, 'filter_hz': float(run.meta['velocity_filter_hz'])}
 
 
-def fit_model(freqs, H, se, kp, kd, ff, vel=None, tau0=5e-4, tau_fixed=None):
+def fit_model(freqs, H, se, kp, kd, ff, vel=None, tau0=5e-4, tau_fixed=None, tau_ref=0.0):
     """Weighted complex least squares for J, b and the loop delay.
 
     J, b and the delay trade off against each other over a band this narrow;
@@ -220,7 +223,7 @@ def fit_model(freqs, H, se, kp, kd, ff, vel=None, tau0=5e-4, tau_fixed=None):
 
     def residual(x):
         J, b, tau = unpack(x)
-        err = (model_response(freqs, J, b, tau, kp, kd, ff, vel) - H) / sigma
+        err = (model_response(freqs, J, b, tau, kp, kd, ff, vel, tau_ref) - H) / sigma
         return np.concatenate([err.real, err.imag])
 
     x0 = [math.log(device_config.NOMINAL_JOINT_INERTIA_KG_M2),
@@ -233,16 +236,17 @@ def fit_model(freqs, H, se, kp, kd, ff, vel=None, tau0=5e-4, tau_fixed=None):
     result = optimize.least_squares(residual, x0, bounds=(lower, upper))
     J, b, tau = unpack(result.x)
     J, b, tau = float(J), float(b), float(tau)
-    fitted = model_response(freqs, J, b, tau, kp, kd, ff, vel)
+    fitted = model_response(freqs, J, b, tau, kp, kd, ff, vel, tau_ref)
     err_db = 20.0 * np.log10(np.abs(H) / np.abs(fitted))
     dense = np.logspace(-2, 3, 4000)
-    model = model_response(dense, J, b, tau, kp, kd, ff, vel)
+    model = model_response(dense, J, b, tau, kp, kd, ff, vel, tau_ref)
     rel = 20.0 * np.log10(np.abs(model) / np.abs(model[0]))
     return {
         'fit_J_kg_m2': J,
         'fit_b_nms_rad': b,
         'fit_delay_ms': 1000.0 * tau,
         'fit_delay_fixed': tau_fixed is not None,
+        'fit_reference_delay_ms': 1000.0 * tau_ref,
         'fit_bandwidth_hz': crossing(dense, rel, -3.0),
         'fit_phase_90_hz': crossing(dense, phase_deg(model), -90.0),
         'fit_rms_error_db': float(np.sqrt(np.mean(err_db ** 2))),
@@ -281,7 +285,9 @@ def plot_bode(levels, fit, kp, kd, ff, headline, f_range, f_measured_max, vel=No
     dense = np.logspace(math.log10(first), math.log10(f_measured_max), 400)
     if fit:
         model = model_response(dense, fit['fit_J_kg_m2'], fit['fit_b_nms_rad'],
-                               fit['fit_delay_ms'] / 1000.0, kp, kd, ff, vel)
+                               fit['fit_delay_ms'] / 1000.0, kp, kd, ff,
+                               None if fit.get('loop') == 'drive' else vel,
+                               fit.get('fit_reference_delay_ms', 0.0) / 1000.0)
         ax_m.plot(dense, 20 * np.log10(np.abs(model)), color=INK, linestyle='--',
                   linewidth=0.9, label='Fitted model', zorder=3)
         ax_p.plot(dense, phase_deg(model), color=INK, linestyle='--', linewidth=0.9, zorder=3)
@@ -455,7 +461,15 @@ def main(argv=None):
     se_fit = np.concatenate([lv['se'][lv['line_valid']] for lv in valid_levels])
     vel = velocity_path(run)
     loop = loop_timing(run)
-    if loop:
+    multisine = df[df['phase'] == 'multisine'] if 'phase' in df else df
+    drive = 'drive_loop' in multisine and bool((multisine['drive_loop'] == 1).all())
+    if drive:
+        # The pucks' own loops: commands reach them 2 SYNC periods late, but they
+        # close their loops at their control rate on their own velocity estimate.
+        fit = fit_model(f_fit, H_fit, se_fit, kp, kd, ff, None, tau0=1e-4,
+                        tau_ref=loop['delay_s'] if loop else 0.0)
+        fit['loop'] = 'drive'
+    elif loop:
         # The loop delay is known; a free delay is fitted too, as a check.
         fit = fit_model(f_fit, H_fit, se_fit, kp, kd, ff, vel, tau_fixed=loop['delay_s'])
         free = fit_model(f_fit, H_fit, se_fit, kp, kd, ff, vel, tau0=loop['delay_s'])
@@ -463,11 +477,19 @@ def main(argv=None):
                     if k in ('fit_J_kg_m2', 'fit_b_nms_rad', 'fit_delay_ms', 'fit_rms_error_db')})
     else:
         fit = fit_model(f_fit, H_fit, se_fit, kp, kd, ff)
+    # In the drive loop the torque changes within each SYNC period and the drives
+    # report it only at the SYNC, in step with that pattern, so the samples alias
+    # it: identify the plant from the PC loop (CST, torque ramps linearly between
+    # samples) and use drive-loop runs for the closed-loop response.
     plant = (plant_from_measured_torque(valid_levels, latest_cogging_model(run.simulated),
                                         run_joint_index(run))
-             if not run.legacy else None)
+             if not run.legacy and fit.get('loop') != 'drive' else None)
     if plant:
         fit.update(plant)
+    elif fit.get('loop') == 'drive':
+        print('  (Plant inertia from measured torque is not computed in the drive loop: its '
+              'torque varies within each SYNC period, which the SYNC-rate samples alias. '
+              'Run the PC loop for the plant.)')
     times = df['time'].to_numpy()
     sample_rate = float(1.0 / np.median(np.diff(times))) if len(times) > 1 else math.nan
 
@@ -547,8 +569,12 @@ def main(argv=None):
         print_truth_comparison(rows)
         print(f"  Effective b {fit['fit_b_nms_rad']:.3g} N m s/rad is not comparable to the "
               f"viscous truth {b_true:.3g}: Kd and friction dominate the loop damping.")
-        tau_true = (loop['delay_s'] + truth['current_loop_time_constant']) if loop else 0.0
-        true_H = model_response(f_fit, J_true, b_true, tau_true, kp, kd, ff, vel)
+        if fit.get('loop') == 'drive':
+            true_H = model_response(f_fit, J_true, b_true, truth['current_loop_time_constant'],
+                                    kp, kd, ff, None, loop['delay_s'] if loop else 0.0)
+        else:
+            tau_true = (loop['delay_s'] + truth['current_loop_time_constant']) if loop else 0.0
+            true_H = model_response(f_fit, J_true, b_true, tau_true, kp, kd, ff, vel)
         dev = 20 * np.log10(np.abs(H_fit) / np.abs(true_H))
         print(f'  Measured vs true rigid model: max |error| {np.max(np.abs(dev)):.2f} dB')
         summary['sim_max_error_vs_true_model_db'] = float(np.max(np.abs(dev)))

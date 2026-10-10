@@ -35,6 +35,9 @@ class ClosedLoopStepConfig:
     settle_s: float = 0.5                   # Before each block of steps
     reposition_speed_deg_s: float = 60.0
     sample_rate_hz: float = 500.0
+    # 'pc': the p4wrist loop's PD (500 Hz, 4 ms to the motor); 'drive': the pucks'
+    # own position loops (needs drive_gain_calibration_experiment.py first).
+    loop: str = 'pc'
 
 
 QUICK = dict(step_sizes_deg=(1.0, 5.0, 10.0), steps_per_size=2, hold_s=0.6, settle_s=0.3)
@@ -97,6 +100,14 @@ async def main(args):
     async with WristSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
+        if cfg.loop == 'drive':
+            ok, why = session.drive_loop_available()
+            if not ok:
+                raise SystemExit(f'The drive loop is not available: {why}')
+            await session.use_drive_loop(cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
+                                         velocity_feedforward=True)
+        elif cfg.loop != 'pc':
+            raise SystemExit("loop must be 'pc' or 'drive'.")
         confirm(args, ['Closed-loop step performance (stiff PD, torque cap engaged)',
                        f'  Kp = {cfg.kp_joint_nm_rad} N m/rad, Kd = {cfg.kd_joint_nms_rad} '
                        f'N m s/rad, steps {cfg.step_sizes_deg} deg x {cfg.steps_per_size}',

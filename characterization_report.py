@@ -184,6 +184,8 @@ def ci_bounds(summary, m):
 def mode_label(mode):
     if mode == 'rt':
         return '500 Hz loop'
+    if mode == 'drive':
+        return 'drive loop'
     match = re.fullmatch(r'host_(\d+(?:\.\d+)?)', mode)
     if match:
         rate = float(match.group(1))

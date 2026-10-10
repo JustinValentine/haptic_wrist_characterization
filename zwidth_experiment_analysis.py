@@ -37,6 +37,8 @@ DIAGNOSTIC_BASENAME = 'diag_zwidth_trials'
 def mode_label(name):
     if name == 'rt':
         return '500 Hz loop'
+    if name == 'drive':
+        return 'drive loop'
     if name.startswith('host_'):
         rate = float(name.split('_', 1)[1])
         return f'Host loop, {rate / 1000:g} kHz' if rate >= 1000 else f'Host loop, {rate:g} Hz'

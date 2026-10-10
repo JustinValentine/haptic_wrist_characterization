@@ -816,9 +816,8 @@ void Wrist::raise(int code, int motor, const std::string& text, bool brake, doub
 	control_dirty_ = true;
 }
 
-void Wrist::dispatch(const CanFrame& f, bool collecting, uint32_t* got)
+void Wrist::dispatch(const CanFrame& f, bool collecting, uint32_t* got, double t)
 {
-	const double t = now();
 	const uint32_t base = f.id & 0x780;
 	const int motor = motorOfNode(int(f.id & 0x7F));
 	if (motor < 0) return;
@@ -938,8 +937,9 @@ void Wrist::supervise(double t)
 		for (int i = 0; i < 3; ++i) {
 			if (statusword_time_[i] > csp_since_ && co::swOperationEnabled(statusword_[i])
 					&& mode_display_[i] != co::MODE_CSP)
-				raise(P4W_FAULT_DRIVE_LOOP, i, format("puck %d did not enter its position loop (mode display %d)",
-						cfg_.node[i], mode_display_[i]), true, t);
+				raise(P4W_FAULT_DRIVE_LOOP, i, format("puck %d did not enter its position loop (mode display %d "
+						"at t=%.3f s; drive loop since %.3f s)", cfg_.node[i], mode_display_[i],
+						statusword_time_[i], csp_since_), true, t);
 		}
 	}
 	if (!zeroed_) return;
@@ -1255,9 +1255,12 @@ void Wrist::cycle()
 
 	// 1. Whatever arrived since the last cycle: statuswords, telemetry, EMCY,
 	//    heartbeats, SDO replies, and late positions (dropped).
+	// Frames read here answered the previous SYNC (or arrived just after it):
+	// stamp them with its time, so a statusword sent before a mode change is
+	// never mistaken for one sent after it.
 	CanFrame f;
 	uint32_t got = 0;
-	while (receive(&f, 0.0)) dispatch(f, false, &got);
+	while (receive(&f, 0.0)) dispatch(f, false, &got, cycle_ == 0 ? t : t_sync_prev_);
 
 	// 2. SYNC: the pucks apply the torques sent last cycle and send positions.
 	CanFrame sync_frame;
@@ -1282,7 +1285,7 @@ void Wrist::cycle()
 			if (manual_ || fault_ == P4W_FAULT_BUS) break;
 			continue;
 		}
-		dispatch(f, true, &got);
+		dispatch(f, true, &got, t);
 	}
 	missed_mask_ = 7u & ~got;
 	for (int i = 0; i < 3; ++i) {

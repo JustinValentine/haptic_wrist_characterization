@@ -48,12 +48,13 @@ class VirtualWallTest(unittest.TestCase):
                              summary['first_active_k_rt_nm_rad'])
         self.assertGreaterEqual(summary['max_passive_k_rt_nm_rad'], 20.0)
 
-        # The loop's measured torque delay is its CST delay (2 SYNC periods); the
-        # host loop adds its own.
+        # The loop's measured torque delay is its CST delay (2 SYNC periods). The host
+        # loop's adds 0-4 ms depending on where its 250 Hz update falls after contact
+        # (one impact per K here), so it is only guaranteed to be longer.
         self.assertAlmostEqual(summary['torque_delay_rt_median_ms'],
                                1000.0 * meta['loop_delay_s'], delta=1.0)
         self.assertGreater(summary['torque_delay_host_250_median_ms'],
-                           summary['torque_delay_rt_median_ms'] + 1.0)
+                           summary['torque_delay_rt_median_ms'])
 
 
 if __name__ == '__main__':

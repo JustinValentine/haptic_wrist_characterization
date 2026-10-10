@@ -97,7 +97,7 @@ private:
 
 	void threadMain();
 	void cycle();
-	void dispatch(const CanFrame& f, bool collecting, uint32_t* got);
+	void dispatch(const CanFrame& f, bool collecting, uint32_t* got, double t);
 	void supervise(double t);
 	void runStateMachine(double t);
 	void control(double t, Vec3* tau_joint);

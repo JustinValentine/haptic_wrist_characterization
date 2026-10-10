@@ -37,12 +37,16 @@ SIM_PARAMS = None   # Tests may inject a p4_sim.SimParams
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class ZWidthConfig:
-    modes: tuple = ('host_250', 'rt')   # 'rt' and/or 'host_<rate_hz>' (max 3)
+    # 'rt' (the 500 Hz PC loop), 'drive' (the pucks' own loops; needs a drive-gain
+    # calibration and positive B) and/or 'host_<rate_hz>' (max 3)
+    modes: tuple = ('host_250', 'rt', 'drive')
     damping_values_nms_rad: tuple = (0.0, 0.05, 0.1, 0.2, 0.5)
     k_start_host_nm_rad: float = 2.0
     k_max_host_nm_rad: float = 300.0
     k_start_rt_nm_rad: float = 10.0
     k_max_rt_nm_rad: float = 1000.0     # Raise to find the loop's limit
+    k_start_drive_nm_rad: float = 20.0
+    k_max_drive_nm_rad: float = 3000.0
     k_factor: float = 1.4                    # Geometric stiffness increment
     refine_steps: int = 1                    # Bisection trials between stable and unstable
     center_deg: float = 0.0                  # Pose the impedance is rendered about
@@ -81,6 +85,9 @@ def parse_mode(name, cfg):
     if name == 'rt':
         return {'name': name, 'renderer': 'rt', 'rate_hz': cfg.sample_rate_hz,
                 'k_start': cfg.k_start_rt_nm_rad, 'k_max': cfg.k_max_rt_nm_rad}
+    if name == 'drive':
+        return {'name': name, 'renderer': 'drive', 'rate_hz': cfg.sample_rate_hz,
+                'k_start': cfg.k_start_drive_nm_rad, 'k_max': cfg.k_max_drive_nm_rad}
     if name.startswith('host_'):
         try:
             rate = float(name.split('_', 1)[1])
@@ -88,7 +95,7 @@ def parse_mode(name, cfg):
             raise SystemExit(f'Bad mode {name!r}; use host_<rate_hz>, e.g. host_250.')
         return {'name': name, 'renderer': 'host', 'rate_hz': rate,
                 'k_start': cfg.k_start_host_nm_rad, 'k_max': cfg.k_max_host_nm_rad}
-    raise SystemExit(f'Unknown mode {name!r}; use "rt" or "host_<rate_hz>".')
+    raise SystemExit(f'Unknown mode {name!r}; use "rt", "drive" or "host_<rate_hz>".')
 
 
 # --- stability classification (also used by the analysis) --------------------------
@@ -255,6 +262,9 @@ async def run_trial(session, cfg, mode, K, B, trial_id, theta0, cap):
     if mode['renderer'] == 'rt':
         await session.set_gains(K, B)
         command = rt_command(theta0, cap, cfg)
+    elif mode['renderer'] == 'drive':
+        await session.use_drive_loop(K, B)
+        command = rt_command(theta0, cap, cfg)
     else:
         command = host_command(K, B, theta0, cap, cfg)
     trial = await session.run_segment(Segment(
@@ -264,7 +274,9 @@ async def run_trial(session, cfg, mode, K, B, trial_id, theta0, cap):
     # Contain: brake (passive damping), restore the safe hold, return to center.
     session.log_event('brake', trial_id=trial_id, ended_by=trial.ended_by)
     await session.brake(cfg.brake_s, info={'trial_id': trial_id})
-    if mode['renderer'] == 'rt':
+    if mode['renderer'] == 'drive':
+        await session.use_pc_loop()
+    if mode['renderer'] in ('rt', 'drive'):
         await session.set_gains(cfg.safe_k_nm_rad, cfg.safe_b_nms_rad)
     here = await session.command(Command(position_deg=math.nan))   # Hold where it stopped
     await session.run_segment(min_jerk_move(here['joint_pos_deg'], theta0,
@@ -291,6 +303,8 @@ async def run_trial(session, cfg, mode, K, B, trial_id, theta0, cap):
 async def sweep(session, cfg, mode, theta0, cap, next_id):
     boundary = []
     for B in cfg.damping_values_nms_rad:
+        if mode['renderer'] == 'drive' and B <= 0:
+            continue   # The drive loop's torque comes from its velocity loop: B > 0.
         last_stable = first_unstable = None
         K = mode['k_start']
         while K <= mode['k_max'] * (1 + 1e-9):
@@ -361,6 +375,12 @@ async def main(args):
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
         cap = cfg.torque_cap_fraction * session.max_torque_nm
+        if any(m['renderer'] == 'drive' for m in modes):
+            ok, why = session.drive_loop_available()
+            if not ok:
+                print(f'WARNING: skipping the drive loop: {why}')
+                modes = [m for m in modes if m['renderer'] != 'drive']
+                session.metadata['drive_loop_skipped'] = why
         n_max = worst_case_trials(cfg, modes)
         confirm(args, [
             'Z-width (renderable impedance range)',

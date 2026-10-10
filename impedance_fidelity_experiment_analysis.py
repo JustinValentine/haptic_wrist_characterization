@@ -76,7 +76,7 @@ def position_column(df):
     return 'joint_pos_deg'
 
 
-def estimate_target(frame, design, column, cogging=None, loop=None, joint=None):
+def estimate_target(frame, design, column, cogging=None, loop=None, joint=None, renderer=None):
     """Displayed impedance per period at the excited lines; mean and SE.
 
     With a cogging model, the cogging torque at the measured motor position is
@@ -97,7 +97,15 @@ def estimate_target(frame, design, column, cogging=None, loop=None, joint=None):
                        design['t_offset_s'])
     t_local = frame['t_local'].to_numpy()
     lag = frame['time'].to_numpy() - frame['t_send'].to_numpy()
-    if loop:
+    zoh = loop is None
+    if loop and renderer == 'drive':
+        # The drive loop adds the disturbance as its torque offset, latched at the
+        # next SYNC and held for the period (no ramp).
+        torque = np.array([signal(t)[0] for t in t_local - lag])
+        t_torque = t_local + loop['period_s']
+        t_theta = t_local
+        zoh = True
+    elif loop:
         torque = np.array([signal(t)[0] for t in t_local - lag])
         t_torque = applied_torque_times(t_local, loop)
         t_theta = t_local
@@ -113,7 +121,7 @@ def estimate_target(frame, design, column, cogging=None, loop=None, joint=None):
         sel = (t_theta >= t0) & (t_theta < t1)
         if sel.sum() < 4 * len(freqs) or ((t_torque >= t0) & (t_torque < t1)).sum() < 4 * len(freqs):
             continue
-        T = (pwl_fourier if loop else zoh_fourier)(t_torque, torque, freqs, t0, t1)
+        T = (zoh_fourier if zoh else pwl_fourier)(t_torque, torque, freqs, t0, t1)
         if cog is not None:
             T = T - fit_sinusoids(t_theta[sel], cog[sel], freqs)[0]
         X, res = fit_sinusoids(t_theta[sel], theta[sel], freqs)
@@ -278,6 +286,8 @@ def expected_delay_s(run, target):
     loop = loop_timing(run)
     if loop is None:
         return 1.5 / target['rate_hz']
+    if target['renderer'] == 'drive':
+        return 0.0   # the drive's own loop: its current loop and velocity filter only
     if target['renderer'] == 'rt':
         return loop['delay_s']
     return loop['delay_s'] + loop['period_s'] + 0.5 / target['rate_hz']
@@ -291,7 +301,8 @@ def frame_modes(df, target_id):
 
 def target_label(t):
     mode = t['mode']
-    loop = '500 Hz loop' if mode == 'rt' else f"host {float(mode.split('_')[1]):g} Hz"
+    loop = ('500 Hz loop' if mode == 'rt' else 'drive loop' if mode == 'drive'
+            else f"host {float(mode.split('_')[1]):g} Hz")
     return f"{loop}, $K$={t['k_nm_rad']:g}, $B$={t['b_nms_rad']:g}"
 
 
@@ -471,7 +482,8 @@ def main(argv=None):
     results = []
     for t in targets:
         frame = excite[excite['target_id'] == t['target_id']] if 'target_id' in excite else excite.iloc[0:0]
-        est = (estimate_target(frame, t['design'], column, cogging, loop, run_joint_index(run))
+        est = (estimate_target(frame, t['design'], column, cogging, loop, run_joint_index(run),
+                               t.get('renderer'))
                if (not t.get('skipped') and len(frame)) else None)
         results.append({**t, **(est or {}), 'measured': est is not None})
     measured = [r for r in results if r['measured']]
@@ -704,7 +716,8 @@ def main(argv=None):
         for t in targets:
             mode = t['mode']
             key = f'impedance_delay_{mode}_ms'
-            delayed = t['renderer'] == 'host' or loop_timing(run) is not None
+            delayed = (t['renderer'] == 'host' or loop_timing(run) is not None) \
+                and t['renderer'] != 'drive'
             if delayed and key in summary and \
                     summary.get(f'impedance_delay_{mode}_target_id') == t['target_id']:
                 expected = 1000.0 * (expected_delay_s(run, t) + truth['current_loop_time_constant'])

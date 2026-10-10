@@ -50,8 +50,10 @@ class ImpedanceConfig:
                       ('rt', 60.0, 0.5),
                       ('host_250', 5.0, 0.0),
                       ('host_250', 20.0, 0.2),
-                      ('host_250', 30.0, 0.3))    # Stiffest: a damping error dB biases the
+                      ('host_250', 30.0, 0.3),    # Stiffest: a damping error dB biases the
                                                     # delay by dB / K
+                      ('drive', 20.0, 0.2),       # The pucks' own loops (needs a drive-gain
+                      ('drive', 100.0, 0.5))      # calibration; B > 0)
     center_deg: float = 0.0
     period_s: float = 4.0                  # Frequency resolution = 1 / period
     periods: int = 5                       # The first is discarded (transient)
@@ -79,7 +81,7 @@ class ImpedanceConfig:
 
 
 QUICK = dict(targets=(('rt', 5.0, 0.0), ('rt', 20.0, 0.2),
-                      ('host_250', 5.0, 0.0), ('host_250', 20.0, 0.2)),
+                      ('host_250', 5.0, 0.0), ('host_250', 20.0, 0.2), ('drive', 20.0, 0.2)),
              period_s=2.0, periods=3, freq_min_hz=1.0, num_lines=20)
 
 PRECHECK_START_S = 0.2   # Target active this long before the pulse
@@ -88,8 +90,10 @@ PRECHECK_START_S = 0.2   # Target active this long before the pulse
 def parse_target(index, target, cfg):
     mode, K, B = target
     K, B = float(K), float(B)
-    if mode == 'rt':
-        renderer, rate = 'rt', cfg.sample_rate_hz
+    if mode in ('rt', 'drive'):
+        renderer, rate = mode, cfg.sample_rate_hz
+        if mode == 'drive' and not B > 0:
+            raise SystemExit('Drive-loop targets need B > 0 (its velocity loop makes the torque).')
     elif isinstance(mode, str) and mode.startswith('host_'):
         try:
             rate = float(mode.split('_', 1)[1])
@@ -97,7 +101,7 @@ def parse_target(index, target, cfg):
             raise SystemExit(f'Bad mode {mode!r}; use host_<rate_hz>, e.g. host_250.')
         renderer = 'host'
     else:
-        raise SystemExit(f'Unknown mode {mode!r}; use "rt" or "host_<rate_hz>".')
+        raise SystemExit(f'Unknown mode {mode!r}; use "rt", "drive" or "host_<rate_hz>".')
     return {'target_id': index, 'mode': mode, 'renderer': renderer, 'rate_hz': rate,
             'k_nm_rad': K, 'b_nms_rad': B}
 
@@ -169,7 +173,7 @@ def render_command(target, theta0, cap, tau_d=None, pulse=None):
             return pulse[2]
         return 0.0
 
-    if target['renderer'] == 'rt':
+    if target['renderer'] in ('rt', 'drive'):
         def command(t, _):
             return Command(position_deg=theta0, torque_nm=extra(t), max_torque_nm=cap)
     else:
@@ -195,7 +199,9 @@ async def contain(session, cfg, target, theta0):
     """Brake, restore the safe hold, and return to the center pose."""
     info = {'target_id': target['target_id']}
     await session.brake(cfg.brake_s, info=info)
-    if target['renderer'] == 'rt':
+    if target['renderer'] == 'drive':
+        await session.use_pc_loop()
+    if target['renderer'] in ('rt', 'drive'):
         await session.set_gains(cfg.safe_k_nm_rad, cfg.safe_b_nms_rad)
     here = await session.command(Command(position_deg=math.nan))
     await session.run_segment(min_jerk_move(here['joint_pos_deg'], theta0,
@@ -214,6 +220,8 @@ async def run_target(session, cfg, target, theta0, cap):
                                       [r['joint_torque_nm'] for r in settle.rows])
     if target['renderer'] == 'rt':
         await session.set_gains(target['k_nm_rad'], target['b_nms_rad'])
+    elif target['renderer'] == 'drive':
+        await session.use_drive_loop(target['k_nm_rad'], target['b_nms_rad'])
 
     pulse_end = PRECHECK_START_S + cfg.precheck_pulse_s
     planned = pulse_end + cfg.precheck_observe_s
@@ -321,6 +329,13 @@ async def main(args):
     async with WristSession(EXPERIMENT, args, cfg.safe_k_nm_rad, cfg.safe_b_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
+        if any(t['renderer'] == 'drive' for t in targets):
+            ok, why = session.drive_loop_available()
+            if not ok:
+                print(f'WARNING: skipping drive-loop targets: {why}')
+                for t in targets:
+                    if t['renderer'] == 'drive':
+                        t['planned_skip'] = f'drive loop unavailable: {why}'
         lines = ['Rendered impedance spectrum (target impedance + torque multisine)',
                  f'  {len(targets)} targets, {cfg.periods} x {cfg.period_s:g} s each, '
                  f'{len(targets[0]["design"]["freqs_hz"])} lines {cfg.freq_min_hz:g}-'

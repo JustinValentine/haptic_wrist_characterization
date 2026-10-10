@@ -33,6 +33,18 @@ J2MP = ((-N2, 0.0, 0.0),
 POSITION_SIGN = (1, 1, 1)          # Per motor; +1 on the wrist pucks (wam8g.conf)
 TORQUE_SIGN = (1, 1, 1)
 
+def joint_count_deg(joint=None):
+    """Joint motion per motor encoder count (deg): (finest, coarsest). FE and UR read
+    two encoders, (m7 - m8)/(2 N1) and (m7 + m8)/(2 N1), so a count on either motor
+    moves them by half a single motor's step; when the two motors' counts happen to
+    line up, the steps come in pairs (the coarse value). One motor's count for PS."""
+    import numpy as np
+    j = JOINT_INDEX if joint is None else joint
+    inverse = np.linalg.inv(np.array(J2MP, dtype=float))
+    steps = [float(abs(inverse[j][i])) * 360.0 / 4096 for i in range(3) if inverse[j][i] != 0.0]
+    return min(steps), sum(steps)
+
+
 # Effective reduction of the joint under test: the largest motor turn per
 # joint turn. The analyses use it to express positions in motor turns, so
 # each motor's cogging (periodic in its own angle) stays periodic. For FE

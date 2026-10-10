@@ -117,7 +117,7 @@ RESERVED_COLUMNS = frozenset({
     'tau_meas_ps_nm', 'tau_meas_fe_nm', 'tau_meas_ur_nm', 'counts_6', 'counts_7', 'counts_8',
     'permille_6', 'permille_7', 'permille_8', 'current_6_a', 'current_7_a', 'current_8_a',
     'motor_angle_6', 'motor_angle_7', 'motor_angle_8', 'drive_demand_nm', 'drive_loop',
-    'target_6', 'target_7', 'target_8',
+    'target_6', 'target_7', 'target_8', 'demand_6_nm', 'demand_7_nm', 'demand_8_nm',
 })
 
 
@@ -1004,7 +1004,9 @@ class WristSession:
             row[f'q_{name}_deg'] = math.degrees(float(q[k]))
             row[f'tau_cmd_{name}_nm'] = float(rec['tau_cmd'][k])
             row[f'tau_meas_{name}_nm'] = float(rec['tau_meas'][k])
+        demand = _MT2J_INV @ np.asarray(rec['tau_demand'], dtype=float)
         for i, node in enumerate(device_config.NODES):
+            row[f'demand_{node}_nm'] = float(demand[i])
             row[f'motor_angle_{node}'] = float(rec['motor_angle'][i])
             if drive:
                 row[f'target_{node}'] = int(rec['motor_target'][i])
@@ -1142,7 +1144,8 @@ class WristSession:
         self.log_event('set_gains', kp_joint_nm_rad=kp_joint_nm_rad,
                        kd_joint_nms_rad=kd_joint_nms_rad, loop=self.loop)
 
-    async def use_drive_loop(self, kp_joint_nm_rad=None, kd_joint_nms_rad=None):
+    async def use_drive_loop(self, kp_joint_nm_rad=None, kd_joint_nms_rad=None,
+                             velocity_feedforward=True):
         """Render with the pucks' own position loops (CSP) from the next command on.
 
         Each puck closes its loop on its own motor at its control rate, so this is
@@ -1151,6 +1154,7 @@ class WristSession:
         and damping; damping must be positive (the drive's velocity loop is what
         makes the torque). Gains come from the latest drive-gain calibration."""
         self.loop = 'drive'
+        self._drive_kvff = 100 if velocity_feedforward else 0
         await self.set_gains(self.kp_joint if kp_joint_nm_rad is None else kp_joint_nm_rad,
                              self.kd_joint if kd_joint_nms_rad is None else kd_joint_nms_rad)
         self.metadata.setdefault('drive_loop_used', True)
@@ -1161,23 +1165,52 @@ class WristSession:
         self.log_event('use_pc_loop')
 
     def drive_calibration(self):
+        """Raw drive gains to motor stiffness and damping, from the latest calibration
+        (in per mille of rated torque per count, so it holds for every puck)."""
         found = latest_summary('drive_gain_calibration', self.is_sim)
         if found is None:
             raise SystemExit('The drive loop needs a gain calibration: run '
                              'drive_gain_calibration_experiment.py and its analysis first'
                              + (' (with --sim for simulated runs).' if self.is_sim else '.'))
         run_dir, summary = found
-        return {'source': run_dir.name, 'k_per_unit': summary['motor_k_per_unit_nm_rad'],
-                'b_per_unit': summary['motor_b_per_unit_nms_rad'],
-                'torque_offset_works': summary.get('torque_offset_works', True)}
+        info = self.metadata['drive_info']
+        to_si = [d['counts_per_rev'] / (2.0 * math.pi) * d['rated_torque_mnm'] / 1e6 for d in info]
+        return {'source': run_dir.name,
+                'k_per_unit': [summary['k_unit_permille_per_count'] * f for f in to_si],
+                'b_per_unit': [summary['b_unit_permille_per_count_s'] * f for f in to_si],
+                'torque_offset_works': bool(summary.get('torque_offset_works', False))}
+
+    def drive_loop_available(self):
+        """(True, '') if the drive loop can render with feedforward, else (False, why)."""
+        if not all(d['drive_targets_mapped'] for d in self.metadata['drive_info']):
+            return False, 'a puck did not accept position targets (0x607A)'
+        try:
+            cal = self.drive_calibration()
+        except SystemExit as exc:
+            return False, str(exc)
+        if not cal['torque_offset_works']:
+            return False, ('the drives ignore the torque offset (0x60B2) in CSP, so the drive '
+                           'loop cannot add a disturbance or feedforward torque')
+        return True, ''
+
+    async def use_drive_loop_raw(self, gains):
+        """Drive loop with raw gains per motor (dicts with kv, kp and optionally ki,
+        kvff, kaff, kout), for the calibration that relates raw gains to stiffness."""
+        for motor, g in enumerate(gains):
+            self.wrist.set_drive_gains(motor, kv=g['kv'], kp=g['kp'], ki=g.get('ki', 0.0),
+                                       kvff=g.get('kvff', 0), kaff=g.get('kaff', 0),
+                                       kout=g.get('kout', 100), timeout_s=1.0)
+        self.drive_gains = gains
+        self.loop = 'drive'
+        self.log_event('drive_gains_raw', gains=gains)
 
     def _apply_drive_gains(self, k_joint, b_joint):
         cal = self.drive_calibration()
         self.metadata['drive_gain_calibration'] = cal['source']
         gains = drive_gains_for_joint(self.j, k_joint, b_joint, cal)
         for motor, g in enumerate(gains):
-            self.wrist.set_drive_gains(motor, kv=g['kv'], kp=g['kp'], kout=g['kout'], kvff=100,
-                                       timeout_s=1.0)
+            self.wrist.set_drive_gains(motor, kv=g['kv'], kp=g['kp'], kout=g['kout'],
+                                       kvff=getattr(self, '_drive_kvff', 100), timeout_s=1.0)
         self.drive_gains = gains
         self.log_event('drive_gains', gains=gains, k_joint=k_joint, b_joint=b_joint)
 
@@ -1289,5 +1322,8 @@ def drive_gains_for_joint(joint, k_joint, b_joint, cal):
 
 
 def _inverse_transpose(m):
-    import numpy as np
     return np.linalg.inv(np.array(m, dtype=float)).T.tolist()
+
+
+# Motor torques from joint torques (tau_m = J2MP^-T tau_q), for the drives' demands.
+_MT2J_INV = np.linalg.inv(np.array(device_config.J2MP, dtype=float).T)

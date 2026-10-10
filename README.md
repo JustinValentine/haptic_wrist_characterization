@@ -8,9 +8,18 @@ and a summary, and can be dry-run against a simulated wrist (`--sim`) before tou
 
 This branch (`p4-wrist`) adapts the suite written for the moteus-driven WHAM wrist
 (`characterization-suite`). The wrist is driven by **`p4wrist/`**, a small real-time C++ library
-written for it (no libbarrett dependency): CANopen setup, a 500 Hz SYNC loop with PD +
-feedforward rendering through the differential, zeroing, and its own safety supervision, since
-the bench has no safety board. See [`p4wrist/README.md`](p4wrist/README.md).
+written for it (no libbarrett dependency): CANopen setup, a SYNC loop (500 Hz, or 1 kHz) with PD
++ feedforward rendering through the differential, the pucks' own onboard position loops as a
+second rendering path, zeroing, and its own safety supervision, since the bench has no safety
+board. See [`p4wrist/README.md`](p4wrist/README.md).
+
+Two principles keep the data true to the device rather than to the controller:
+* **Identify the plant from measured torque.** J, b and friction come from the drives' measured
+  q-axis current against position (equation of motion, integrated twice), which holds whatever
+  loop produced the torque. Loop models are only cross-checks.
+* **Measure what is otherwise assumed.** Every run measures its command-to-torque delay and
+  checks the torque scale at start, logs its loop timing (analyses flag late cycles and lost
+  positions), and the drive loop's gains are calibrated by measurement, not by unit guesses.
 
 | What it measures | Experiment | Setup | Paper figure |
 |---|---|---|---|
@@ -27,6 +36,7 @@ the bench has no safety board. See [`p4wrist/README.md`](p4wrist/README.md).
 | **Rendered stiffness/damping vs frequency, loop delay, predicted stability limit** | `impedance_fidelity_experiment.py` | free, no hand contact | `fig_impedance_spectrum`, `fig_impedance_free` |
 | **Virtual-wall impacts: restitution, wall energy, rate-hardness** | `virtual_wall_experiment.py` | free, no hand contact | `fig_virtual_wall`, `fig_virtual_wall_hardness` |
 | **Large-signal dynamic envelope: largest linear amplitude vs frequency** | `dynamic_envelope_experiment.py` | free | `fig_dynamic_envelope` |
+| What the pucks' onboard loop gains render (needed by the drive loop) | `drive_gain_calibration_experiment.py` | free | `fig_drive_gain_calibration` |
 | One summary table (CSV, Markdown, LaTeX) | `characterization_report.py` | after the analyses | `report/characterization_table.tex` |
 
 Bold rows are the experiments designed for the WHAM wrist (see
@@ -79,12 +89,17 @@ top of each experiment script.
 * `GEAR_RATIO` is the largest motor turn per joint turn of the joint under test (N2 for PS, N1
   for FE/UR); `motor_pos_rev` is the joint angle in those motor turns, so each motor's cogging
   stays periodic in it.
-* Positions come from the **motor encoders** (4096 counts per motor turn: 0.010° at PS, 0.0117°
-  at FE/UR). Cable stretch is therefore invisible to the free-motion experiments.
-* Torques: `control_joint_torque_nm` is the loop's command after limits; `joint_torque_nm` is
-  the drives' measured q-axis current times Kt (the P4 reports phase-peak current and Kt per
-  A rms, so torque = Kt·I/√2, not yet checked on this wrist). The torque calibration experiment
-  measures the true scale factor; the report applies it.
+* Positions come from the **motor encoders** (4096 counts per motor turn). PS moves 0.010° per
+  count. FE and UR read both differential motors, (m7 ∓ m8)/(2·N1), so a count on either motor
+  moves them 0.0059°: their steps are 0.0059–0.0117° depending on how the two motors' counts
+  interleave (`device_config.joint_count_deg`). Cable stretch is invisible to the free-motion
+  experiments.
+* Torques: `control_joint_torque_nm` is the loop's command after limits (in the drive loop, the
+  drives' own demand); `drive_demand_nm` is the drives' internal torque demand (0x6074) in either
+  loop; `joint_torque_nm` is the drives' measured q-axis current times Kt (the P4 reports
+  phase-peak current and Kt per A rms, so torque = Kt·I/√2; each run's start-up probe checks
+  measured against commanded torque). The torque calibration experiment measures the true scale
+  factor; the report applies it.
 
 ### What every experiment does to the wrist
 At startup the session brings the pucks up (keeping the previous zero when no puck was reset,
@@ -93,8 +108,15 @@ else resetting them and zeroing from the single-turn encoders or the home pose),
 commands the joint under test (PD + velocity feedforward + feedforward torque, or a stay-within
 wall) and keeps the other two at their start angles with the `HOLD_*` gains. Every loop cycle is
 logged from the library's own log, tagged with the command it used. On exit (normal, Ctrl-C, or
-a safety abort) it brakes if aborting, disables the drives, disarms the drives' SYNC-loss timer,
-stops the loop, and saves the data with a `completed` flag and the abort reason.
+a safety abort) it brakes if aborting, disables the drives, restores any drive gains it changed,
+disarms the drives' SYNC-loss timer, stops the loop, and saves the data with a `completed` flag
+and the abort reason.
+
+Right after enabling, a short probe (±0.15 N·m pulses on the joint under test, 0.15 s) finds how
+many cycles a command takes to reach the motor, from the drives' measured current, and checks
+measured against commanded torque. The analyses use this measured delay. The joints not under
+test are held at 40 N·m/rad (`HOLD_*`): softer than a joint's cogging stiffness, a held FE or UR
+snaps between detents while the other moves, which leaks into the joint under test.
 
 ## Bench bring-up
 
@@ -105,6 +127,8 @@ python zero_calibration.py      # home pose + single-turn encoder survey -> wris
 python wrist_check.py status    # drives off: move each joint by hand; its angle must increase
 python wrist_check.py nudge     # small positive torque per joint: each must move positive
 python wrist_check.py hold      # holds the start pose with the HOLD gains
+python drive_gain_calibration_experiment.py   # once, before any drive-loop experiment
+python drive_gain_calibration_experiment_analysis.py
 ```
 
 `nudge` is the important one: a joint that moves negative under positive torque turns every PD
@@ -124,6 +148,10 @@ There is no safety board on the bench, so the p4wrist loop supervises everything
   the zero), drive faults (EMCY and statusword), drives dropping out of Operation Enabled;
 * host death: the drives' SYNC-loss timeout (0x2406) is set to 20 ms once SYNC runs, so if the
   process dies the drives fault and ground their phases.
+
+In the drive loop the pucks render the joints themselves: the loop still supervises position,
+speed, liveness and the host watchdog every cycle, but torque is then limited only by each
+drive's own current limit (0x3011:09), not by `MAX_JOINT_TORQUE_NM`.
 
 Faults latch until cleared; enabling is refused outside the joint limits or without a zero. On
 top, the host checks every logged sample against `device_config` limits (travel relative to the
@@ -154,8 +182,8 @@ Recommended order on hardware (later experiments reuse earlier results where not
 joint you characterize:
 1. `step_input_experiment.py`: J, b, fc (used to sanity-check later fits)
 2. `ramp_input_experiment.py`: static friction (used by the step analysis model replay)
-3. `friction_sweep_experiment.py`: friction and cogging models (used by transparency compensation
-   and subtracted by later analyses)
+3. `friction_sweep_experiment.py`: friction and per-motor cogging models (used by transparency
+   compensation and subtracted by later analyses), then `drive_gain_calibration_experiment.py`
 4. `schroeder_bandwidth_experiment.py`, `closed_loop_step_experiment.py`,
    `dynamic_envelope_experiment.py` (uses J from step 1 to plan its amplitudes)
 5. `zwidth_experiment.py`, then `impedance_fidelity_experiment.py` (skips targets above 0.7x the
@@ -169,6 +197,12 @@ Cross-experiment lookups only use runs of the same kind: a `--sim` dry run never
 parameters into a hardware experiment, and vice versa. They do not yet distinguish joints, so
 analyze one joint's runs before moving to the next (or keep each joint's data in its own copy).
 
+Identify the plant (steps 1–3) in the PC loop: its torque ramps linearly between SYNC samples,
+so the measured current is exact there. In the drive loop the torque varies within each SYNC
+period and the SYNC-rate current samples alias it. The bandwidth and closed-loop step
+experiments take `loop='drive'` in their config; Z-width and the impedance spectrum include a
+`'drive'` rendering mode.
+
 Common options for every experiment: `--sim`, `--quick` (shortened protocol), `--yes`,
 `--out DIR`, `--seed N` (simulator), `--interface can0`. Every analysis accepts a run directory
 or CSV (default: the latest run), `--no-show`, and `--paper-dir` (default `figures/ieee`; `""`
@@ -176,23 +210,36 @@ to skip).
 
 ## What the simulation predicts for this wrist
 
-The simulator's motor parameters are placeholders of the right order (see below), but the loop
-structure is the real one, and it shapes every haptic result:
+The simulator's motor parameters are placeholders of the right order (see below; real ones are
+loaded from the pucks after the first hardware connect), but the loop structure is the real one,
+and it shapes every haptic result:
 
-* **Loop delay.** One SYNC every 2 ms; a puck latches the torque sent after a SYNC at the next
-  SYNC and ramps to it over the following period (CST). A torque therefore reaches the motor
-  **4 ms** after the position it was computed from, plus the drive's current loop. The velocity
-  used for damping lags further (half a period of differencing plus the filter).
-* **Stiffness ceiling.** A gain scan on FE and PS (J ≈ 0.0054 kg·m²) finds stable PD up to about
-  40 N·m/rad with a 30 Hz velocity filter (libbarrett-canopen's wrist gains are 20/10/10) and
-  about 80 N·m/rad at 100 Hz (`VELOCITY_FILTER_HZ`, default 100) or 120 at 250 Hz. The suite's
-  "stiff" gains are therefore Kp = 80, Kd = 1.0 (the moteus WHAM wrist used 450–600).
-* **Passivity.** With b ≈ 0.02 N·m·s/rad the loop renders an undamped spring passively only up
+* **Two rendering paths.** The PC loop (`'rt'`) computes PD on the host and sends torques over
+  CAN in CST mode: a puck latches a torque at the next SYNC and ramps to it over the following
+  period, so a torque reaches the motor **4 ms** after the position it came from at 500 Hz
+  (2 ms at 1 kHz). The drive loop (`'drive'`) runs PD inside each puck (CSP, at the drive's
+  control rate) with no CAN round trip in the feedback; this is the moteus-firmware analogue.
+  It works through the differential with one constraint: each puck closes its loop on its own
+  motor, so FE and UR always get the same stiffness and damping, and B must be positive.
+* **Stiffness ceiling of the PC loop.** A gain scan on FE and PS (J ≈ 0.0054 kg·m²) finds stable
+  PD up to about 40 N·m/rad with a 30 Hz velocity filter (libbarrett-canopen's wrist gains are
+  20/10/10) and about 80 N·m/rad at 100 Hz (`VELOCITY_FILTER_HZ`, default 100). The suite's
+  "stiff" PC-loop gains are Kp = 80, Kd = 1.0 (the moteus WHAM wrist used 450–600).
+* **The drive loop removes the ceiling.** In the quick Z-width run the drive loop holds about
+  900 N·m/rad at B = 0.3 against about 110 for the PC loop; in the impedance spectrum it renders
+  K = 20 within 2% with no measurable delay and stays faithful over the whole 20 Hz band (PC
+  loop 5.7 Hz, 250 Hz host loop 3.1 Hz). These depend on the emulated drive's loop, so treat
+  them as what to look for on the hardware.
+* **Passivity.** With b ≈ 0.02 N·m·s/rad the PC loop renders an undamped spring passively only up
   to about b/(T/2) ≈ 10 N·m/rad; friction stretches that at small amplitudes. A host loop on top
-  (Python, VR, teleoperation) adds its period and sample age to the 4 ms.
-* **Resolution.** 4096 counts per motor turn give 0.0117° per count at FE/UR and 0.010° at PS.
-  The cable's deflection at the test torque spans only ~8 counts, which limits the stiffness
-  measurement to ~15% and rules out the dynamic transmission test without an output encoder.
+  (Python, VR, teleoperation) adds its period and sample age.
+* **Cogging belongs to the motors.** FE's cogging is the sum of the two differential motors'
+  ripples, with a relative phase that moves 450 rad per rad of UR: a joint-level FE amplitude
+  belongs to a UR angle known to 0.06°. The suite therefore models cogging per motor, against
+  each motor's own angle, which holds at any pose and for any joint.
+* **Resolution.** The motor encoders step FE/UR by 0.0059–0.0117° and PS by 0.010°. The cable's
+  deflection at the test torque spans ~8–16 steps, which limits the stiffness measurement to
+  ~15% and rules out the dynamic transmission test without an output encoder.
 
 ## Simulator and tests
 
@@ -200,7 +247,10 @@ structure is the real one, and it shapes every haptic result:
 
 * **Pucks**: `SimP4` extends barrett-puck's `MockP4` (vendored in `vendor/barrett_puck`,
   unmodified) with what the library depends on: physics (counters restarting at 0 on reset,
-  absolute single-turn encoders, q-axis current), the CST torque ramp, IDLE with grounded phases,
+  absolute single-turn encoders, q-axis current, torque demand), the CST torque ramp, the CSP
+  position loop (position P → velocity PI → torque at 20 kHz with the DevKit's default gains and
+  200 Hz velocity filter; the gain *units* are this emulator's assumption, which the calibration
+  experiment then has to recover), the motor data a puck stores, IDLE with grounded phases,
   boot-up after an extra heartbeat, heartbeats on the 0x1017 period, SYNC-loss faults, the
   self-disable after ~55 SYNCs without a controlword, RPDOs applied on receipt (type 255),
   TPDO2 every 100 ms whatever its type (as measured on firmware 4.3.2), mode writes accepted
@@ -216,20 +266,25 @@ differential rotors + 0.002 output), b = 0.019 N·m·s/rad, fc = 0.086 N·m, fs 
 stiffness 1500 N·m/rad, drive limit ≈ 0.96 N·m per motor (the WAM wrist's 23.5 A peak setting).
 Motor parameters are ILM50-class placeholders, not datasheet values: rotor 3e-5 kg·m², Kt 58
 mNm/A (the pucks' configured value), cogging 2 mN·m at 60 cycles per turn (assuming 12 slots).
-Ground truth for the joint under test is stored in each simulated run's metadata, and every
+After the first hardware connect the simulator takes each motor's rotor inertia, Kt, resistance,
+inductance, current limits and position-loop gains from what the pucks store
+(`data/p4wrist_drive_params.json`; `SIM_USES_DRIVE_PARAMS`). Ground truth for the joint under test is stored in each simulated run's metadata, and every
 analysis prints estimate-vs-truth when it analyzes a simulated run.
 
 ```bash
-python -m unittest discover -s tests -t .      # 42 tests: the library and every experiment
+python -m unittest discover -s tests -t .      # 51 tests: the library and every experiment
 cmake --build p4wrist/build && p4wrist/build/p4wrist_tests   # C++ unit tests
 ```
 
 `tests/test_p4wrist.py` exercises the library itself against the emulated pucks: bus layout,
 warm and cold connects, rough-placement zeroing, tracking on all joints, differential torque
 signs, saturation, stay-within, braking, and every fault path (limits, watchdog, lost puck, EMCY,
-puck reset, host death, clean stop). The other tests run each experiment's quick protocol and
-check its analysis against the ground truth or, for the loop's dynamics, against an independent
-model of the delayed loop.
+puck reset, host death, clean stop), the drive loop (bumpless entry and exit, rendered stiffness,
+gains written and restored, supervision) and a 1 kHz loop. The other tests run each experiment's
+quick protocol and check its analysis against the ground truth or, for the loop's dynamics,
+against an independent model of the delayed loop. `tests/test_drive_loop.py` checks that the
+gain calibration recovers the emulated drive's units, detects an ignored torque offset, and that
+the drive loop out-renders the PC loop.
 
 ---
 
@@ -290,14 +345,24 @@ the motion direction d_n is constant, so each half-cycle starting from rest at a
 
 after exactly half a damped period π/ω_d.
 
-**Analysis.** Turning points are detected with noise-scaled hysteresis and refined by parabolic
-interpolation. A pooled linear regression over every half-cycle of every step gives r (viscous
-damping) and fc (Coulomb friction) *separately*; the half-cycle durations give ω_d. Then
+**Analysis (primary: measured torque).** Turning points are detected with noise-scaled
+hysteresis and refined by parabolic interpolation. Over each half-cycle the motion has one
+direction d, so the equation of motion of the joint with the motors' *measured* torque,
+J θ̈ + b θ̇ + fc·d + τ0 = τ_measured (cogging model removed), is integrated twice from the
+half-cycle's start (its start velocity a free parameter per piece) and solved by least squares
+over all half-cycles of all steps (`analysis_common.fit_rigid_body`). Positions are never
+differentiated, and the torque is integrated as the linear ramp the P4 applies between SYNCs.
+This needs no model of the loop's gains or delay. Confidence intervals come from bootstrapping
+whole steps. In simulation it recovers J, b and fc within 0.1%, 1.3% and 0.1%.
+
+**Cross-check (ring-down, `ringdown_*` in the summary).** A pooled linear regression of the
+turning-point amplitudes gives r (viscous damping) and fc (Coulomb friction) *separately*; the
+half-cycle durations give ω_d. Then
 ω_n = ω_d/√(1 − ζ²), J = Kp/ω_n², b = 2Jζω_n: the inertia and damping the delayed loop shows. To
 second order in s, a PD loop with delays T_p (spring) and T_d (damping) adds −Kd·T_d + Kp·T_p²/2
 to the apparent inertia and Kd − Kp·T_p to the damping, so J and b are corrected with the run's
-logged loop delays (`analysis_common.correct_for_loop`). 95% confidence intervals come from bootstrapping
-whole steps, per-size fits check amplitude dependence, and the identified model is replayed on
+logged loop delays (`analysis_common.correct_for_loop`). Per-size fits check amplitude
+dependence, and the identified model is replayed on
 every step (piecewise-analytic solution, using the measured static friction when a ramp
 analysis exists) to report a fit percentage. Half-cycles are left out of the regression when the
 delivered torque falls short of the command by more than 20% of its peak (back-EMF on the first
@@ -306,8 +371,9 @@ trap the joint, estimated as twice the median rest offset; the replay skips the 
 
 Plain logarithmic decrement attributes Coulomb decay to viscous damping, and the
 oscillation-center offset is dominated by viscous decay; in simulation those biased b by +62%
-and fc by +134%. On the simulated P4 wrist this method recovers J, b, and fc to within 2%,
-5%, and 1%.
+and fc by +134%. On the simulated P4 wrist the ring-down recovers J, b, and fc to within 2%,
+5%, and 1%, but only through the loop model; a disagreement between the two methods points at the
+loop model, not the plant.
 
 **Outputs.** `fig_step_identification`: (a) a normalized step response with the identified
 model; (b) amplitude lost per half-cycle vs amplitude (slope = viscous, intercept = Coulomb).
@@ -349,8 +415,13 @@ friction(v) + conservative(θ).
 **Analysis.** Forward and backward passes are paired on position bins:
 friction = (τ₊ − τ₋)/2 and conservative = (τ₊ + τ₋)/2 (gravity, cable preload). Cogging is
 identified first from the passes at or below 2 °/s: the peak of their averaged position spectrum
-gives its cycles per motor revolution, and a least-squares harmonic series in absolute motor
-position gives its amplitude and phase, saved as the cogging model. Every position bin is then
+gives its cycles per motor revolution. Then each moving motor's own measured torque is fitted
+against its own zeroed angle with a harmonic series at that period (a cubic trend per pass
+removes its share of friction). At these speeds a motor is quasi-static, so its torque is its
+own cogging however stiffly the loops track and however the other differential joint moves.
+The per-motor series are the cogging model; mapped through the differential, they give the
+cogging at any pose and for any joint (`analysis_common.cogging_torque`). Runs without
+per-motor currents fall back to a joint-level harmonic series. Every position bin is then
 widened to whole cogging periods so cogging averages out. The loop's damping also draws a drag
 from the cogging ripple, largest where the cogging frequency nears the loop's resonance; it is
 predicted from the cogging model and the loop's dynamic stiffness (with the logged velocity
@@ -360,12 +431,11 @@ it exceeds 20% of the friction are left out. The Stribeck + viscous model
 errors. The conservative torque is summarized by its trend and by the remaining ripple after
 noise correction. Friction is also reported as a percentage of the torque cap.
 
-Positions here are joint angles in motor turns (`motor_pos_rev` = GEAR_RATIO × joint turns):
-both differential motors turn N1 times per FE or UR turn, so each motor's cogging stays periodic.
-On FE and UR the two motors' ripples add with a phase set by the other joint's angle, so the
-cogging model belongs to that pose. Because the loop is at most ~80 N·m/rad stiff against
-cogging that is itself ~14 N·m/rad stiff, part of the ripple becomes position ripple: in
-simulation the amplitude reads ~20–25% low (the period to 0.5%).
+On FE and UR the two motors' ripples add with a relative phase that moves 450 rad per rad of
+the other joint, so a joint-level FE amplitude is a property of a UR angle known to 0.06°; the
+summary reports each motor's amplitude (`cogging_motor_amplitudes_nm`) and the joint amplitude
+they make at the sweep's mean pose, which can lie anywhere between N1·|a7 − a8| and
+N1·(a7 + a8). In simulation the per-motor amplitudes are within 10% (the period to 0.5%).
 
 **Outputs.** `fig_friction_velocity`: friction vs speed (log axis) with the fitted Stribeck
 curve; `fig_friction_position`: torque vs position for both directions and their midline.
@@ -390,10 +460,15 @@ mean and standard error across periods. Lines with SNR < 10 and levels that sat 
 cap more than 1% of the time are excluded. Reported: −3 dB bandwidth relative to the
 low-frequency gain (or a lower bound when it lies above the tested range), −90° phase
 frequency, resonance peak, and a fit of H = e^(−sτ)(Kp + FF·Kd·s)/(Js² + bs + e^(−sτ)(Kp + Kd D(s)))
-giving J (a cross-check of the step test) and a model-extrapolated bandwidth. For the p4wrist
-loop D(s) = s·e^(−sT/2)/(1 + s/ω_f) (velocity from differenced, filtered positions) and τ is
-fixed at the loop's 2-period delay; J and b trade off when Kd dominates the damping (J within
-~12% in simulation), so a free-delay fit is reported only as a check. The fitted b is an *effective* damping dominated by Kd and friction; report damping
+giving a model-extrapolated bandwidth. For the PC loop D(s) = s·e^(−sT/2)/(1 + s/ω_f)
+(velocity from differenced, filtered positions) and τ is fixed at the measured loop delay; J and
+b trade off when Kd dominates the damping, so the plant's inertia comes from measured torque
+instead: Z = T_measured/Θ at the excited lines has Re Z = k − Jω² (− cω⁴), which gives J
+(`plant_J_kg_m2`, within 1% in simulation) with no loop model, a cross-check of the step test.
+In the drive loop the measured torque varies within each SYNC period and the SYNC-rate samples
+alias it, so `plant_J` is skipped there (identify the plant in the PC loop) and the loop model
+has a free delay on the drives' feedback path (the reference still arrives one loop delay
+late). The fitted b is an *effective* damping dominated by Kd and friction; report damping
 from the step and sweep tests instead. Data from the earlier single-period 100 Hz script are
 re-analyzed with a one-period DFT and flagged as legacy.
 
@@ -421,7 +496,8 @@ which the delivered torque first falls below 95% of the cap marks the back-EMF k
 
 In simulation the saturated acceleration matches cap/J within 1.5%, and the 1° step overshoots
 ~27%: a delay-free loop with these gains would overshoot ~2%, so this is the 4 ms loop delay
-(the test checks it against a model of the loop's sampling, filter and CST ramp).
+(the test checks it against a model of the loop's sampling, filter and CST ramp). With
+`loop='drive'` the same steps run on the pucks' own position loops.
 
 **Outputs.** `fig_closed_loop_steps`: (a) normalized responses per step size; (b) rise and
 settling time vs step size.
@@ -429,10 +505,12 @@ settling time vs step size.
 ### Z-width: renderable impedance range
 `zwidth_experiment.py` → `zwidth_experiment_analysis.py`
 
-**Protocol.** A virtual spring-damper τ = −K(θ − θ0) − Bθ' is rendered either by the p4wrist
-500 Hz loop (`rt` mode, the limit of the wrist's own loop) or by the host from the previous
-measurement as feedforward torque (`host_<rate>` modes, the situation of a PC-side haptic
-simulation, which adds its own period and sample age to the loop's delay). For each B, K increases
+**Protocol.** A virtual spring-damper τ = −K(θ − θ0) − Bθ' is rendered by the pucks' own
+position loops (`drive` mode, B > 0, K from 20 up to 3000 N·m/rad, skipped with a note when the
+drive-gain calibration is missing or found the torque offset ignored), by the p4wrist 500 Hz loop
+(`rt` mode, the limit of the PC loop) or by the host from the previous measurement as
+feedforward torque (`host_<rate>` modes, the situation of a PC-side haptic simulation, which
+adds its own period and sample age to the loop's delay). For each B, K increases
 geometrically (×1.4, then one bisection step) until a 1 N·m × 5 ms torque pulse produces a
 response that does not decay. Each trial is contained by deviation, speed, and torque-chatter
 stops, a brake, and a smooth return to a safe hold. Run with the handle free.
@@ -445,7 +523,8 @@ unstable. Every trial is reclassified offline from the raw data.
 **Outputs.** `fig_zwidth`: largest stable K vs B per mode, first unstable K marked, and lower
 bounds (no instability up to the largest K tested) shown with arrows. With Coulomb friction the
 boundary depends on the disturbance size, so state the pulse in the caption. In simulation the
-500 Hz loop holds about 2.5× the host loop's stiffness at B = 0, roughly the ratio of their delays.
+500 Hz loop holds about 2.5× the host loop's stiffness at B = 0, roughly the ratio of their delays,
+and the drive loop about 8× the 500 Hz loop's at B = 0.3.
 
 ### Transmission stiffness, lost motion, and resonance (output clamped)
 `transmission_stiffness_experiment.py` → `transmission_stiffness_experiment_analysis.py`
@@ -453,10 +532,11 @@ boundary depends on the disturbance size, so state the pulse in the caption. In 
 **Protocol.** With the output clamped, motor-side rotation is cable stretch plus any backlash.
 Phase 1: slow triangular torque cycles 0 → +T → −T → 0 (default T = 80% of the cap). Phase 2
 (off by default on this wrist): a low-crest-factor torque multisine (1–200 Hz) about a preload
-that keeps the cable out of backlash. One P4 motor count is 0.0117° at FE (0.010° at PS), about
-0.3 N·m of cable torque at ~1500 N·m/rad, so the static loops span only ~8 counts (stiffness to
-~15%) and the multisine's motion is below one count; enable it only with an output encoder or a
-larger amplitude (the experiment warns when its motion is under 5 counts).
+that keeps the cable out of backlash. FE moves 0.0059–0.0117° per motor count (PS 0.010°),
+0.15–0.3 N·m of cable torque at ~1500 N·m/rad, so the static loops span only ~8–16 steps
+(stiffness to ~15%) and the multisine's motion is around one step; enable it only with an output
+encoder or a larger amplitude (the experiment warns when its motion is under 5 of the finest
+steps).
 
 **Analysis.** Stiffness is a common-slope fit with separate zero-torque intercepts per torque
 side (so backlash does not bias the slope); lost motion is the intercept gap; the loading vs
@@ -529,12 +609,14 @@ multisine (0.5–20 Hz, about 30 lines, designed for roughly equal motion per li
 within a budget) is added on top. Every target is first stability-checked with a torque pulse
 (same rule as Z-width) and skipped if it rings; targets above 0.7× a measured Z-width limit are
 skipped outright. Defaults: a near-free target in the 500 Hz loop (K = 5, B = 0), loop K = 20
-(B = 0.2) and 60 (B = 0.5), host (250 Hz) K = 5 (B = 0), 20 (B = 0.2) and 30 (B = 0.3). Run with
-the handle free.
+(B = 0.2) and 60 (B = 0.5), host (250 Hz) K = 5 (B = 0), 20 (B = 0.2) and 30 (B = 0.3), and drive
+loop K = 20 (B = 0.2) and 100 (B = 0.5), the drive targets skipped without a drive-gain
+calibration. Run with the handle free.
 
 **Analysis.** The disturbance torque is rebuilt from the stored design at each command's send
-time and integrated exactly as the drive applies it (a ramp ending 2 SYNC periods after the loop
-cycle that used it); position is fitted at the SYNC sample times. That gives the displayed
+time and integrated exactly as the drive applies it (in the PC loop a ramp ending 2 SYNC periods
+after the loop cycle that used it; in the drive loop, as a torque offset, held from the next
+SYNC); position is fitted at the SYNC sample times. That gives the displayed
 impedance Z = T/Θ per period, with standard errors. Subtracting the near-free target line by
 line, Z_r = Z_target − Z_free + K_c·e^(−jωT_loop), removes inertia, friction and transmission
 dynamics without a device model and leaves what the loop renders (the reference's own spring
@@ -555,12 +637,15 @@ spring path, 4.2 ms, and its filtered damping path, ~6.8 ms) and the 250 Hz host
 N·m/rad is linearly unstable (K_crit ≈ b/T); friction keeps such springs quiet at small
 amplitude [5], so a pulse test overstates how stiff a wall can be under larger disturbances.
 With Coulomb friction at these ~2° motions the subtraction biases stiffness by up to ~10%
-(~2% without friction); mention it in the caption.
+(~2% without friction); mention it in the caption. The drive loop renders K = 20 within 2% with
+no measurable delay and a fidelity bandwidth over the whole 20 Hz band (500 Hz PC loop 5.7 Hz,
+250 Hz host 3.1 Hz).
 
 ### Virtual-wall impacts: restitution, wall energy, rate-hardness
 `virtual_wall_experiment.py` → `virtual_wall_experiment_analysis.py`
 
-**Protocol.** The wrist launches itself under stiff tracking toward a unilateral virtual wall
+**Protocol.** (PC loop and host only: the drives' position loops cannot render a unilateral
+wall.) The wrist launches itself under stiff tracking toward a unilateral virtual wall
 (default at +10°), is released 1.5° before contact, and the wall alone governs the impact. The
 wall is rendered either by the p4wrist loop in stay-within mode (bound at the wall, gains
 selected per phase by kp/kd scales) or by the host loop from the previous sample. Sweep: two
@@ -633,9 +718,13 @@ series) and are written only to the run directory. Check them before trusting a 
 data/<experiment>/<YYYYmmdd-HHMMSS>[_sim]/
     <experiment>_data.csv          one row per loop cycle (2 ms), joint-side units
     <experiment>_metadata.json     config, p4wrist loop config, drive info, zero, git commit,
-                                   events, abort reason (and ground truth when simulated)
+                                   measured loop delay and probe, loop timing, events,
+                                   abort reason (and ground truth when simulated)
     analysis/                      results tables, summary.csv/json, analysis metadata, figures/
 data/p4wrist_zero_record.json      the zero kept between runs (git-ignored)
+data/p4wrist_drive_params.json     each puck's stored motor data and gains, from the last
+                                   hardware connect; the simulator uses it (commit it so
+                                   simulations on other machines use the real motors)
 wrist_calibration.json             home pose and single-turn encoder survey (zero_calibration.py)
 figures/ieee/                      latest paper figures
 report/                            characterization_summary.csv, characterization_table.tex/.md
@@ -646,7 +735,13 @@ joint-side command (position, velocity feedforward, feedforward torque, gain sca
 measured joint position, velocity and torque, the primary motor's q-axis current, the loop's
 setpoint and commanded torque, bus voltage, temperatures, mode/fault, the phase and segment of
 the protocol, all three joints' angles and torques, every motor's counts, torque target and
-current, and the loop's lateness. Simulated runs (`*_sim`) are git-ignored.
+current, each motor's zeroed angle (`motor_angle_<node>`) and internal torque demand
+(`demand_<node>_nm`, joint-referred in `drive_demand_nm`), in the drive loop each motor's
+position target (`target_<node>`) and `drive_loop`, and the loop's lateness. Simulated runs
+(`*_sim`) are git-ignored.
+
+Every analysis checks the run's loop timing (late cycles, cycles with a lost position) and warns
+when more than 1% of cycles were late; the summary carries `timing_*` keys.
 
 ## Hardware notes
 
@@ -658,6 +753,18 @@ current, and the loop's lateness. Simulated runs (`*_sim`) are git-ignored.
   wrist's hard stops for your home pose.
 * The P4 torque scale (rated torque 0x6076, Kt 0x3011:04 and the phase-peak/rms convention)
   comes from the drives' own configuration; the torque calibration measures what it really is.
+  Run it before trusting any torque-derived number. The start-up probe's
+  `measured_over_commanded_torque` should read ~1; if it does not, check
+  `CURRENT_TORQUE_FACTOR` first.
+* The metadata's `torque_measured` flag says whether the drives' current reached the log; if
+  0x6078 cannot be mapped, the measured-torque identifications fall back to the loop models.
+* Drive loop, unknown until the first hardware run: the units of the pucks' position and
+  velocity gains (`drive_gain_calibration_experiment.py` measures them, and nothing renders in
+  the drive loop without that calibration), whether the torque offset 0x60B2 is added in CSP
+  (the calibration checks it; without it the drive loop has no feedforward and the experiments
+  leave it out), and whether 0x607A, 0x60B2 and 0x6074 can be mapped into PDOs.
+* A 1 kHz loop (`LOOP_PERIOD_S = 0.001`) halves the PC loop's delay; check the logged timing
+  (late cycles, `tpdo_wait_s`) before using it for results.
 * The motor thermistor's scale is unknown; until `MOTOR_THERMISTOR` is set, the thermal test
   rates the amplifier, not the winding.
 * The ATI Net F/T reader in `experiment_common.py` has not been tested on hardware; check its
@@ -670,8 +777,11 @@ current, and the loop's lateness. Simulated runs (`*_sim`) are git-ignored.
   both.
 * State that positions are motor-encoder based (4096 counts per motor turn) and joint-referred,
   and give the transmission stiffness alongside the free-motion results.
-* State the loop: 500 Hz CANopen SYNC, cyclic synchronous torque (4 ms from sample to torque),
-  the velocity filter, and for host-rendered results the host rate.
+* State the loop: for the PC loop, 500 Hz CANopen SYNC, cyclic synchronous torque, the measured
+  sample-to-torque delay (4 ms nominal), the velocity filter, and for host-rendered results the
+  host rate; for the drive loop, the pucks' CSP loop, the calibrated gains and the joint
+  stiffness/damping they render (FE and UR always share them).
+* State that J, b and fc come from measured motor current, not from the controller.
 * Apply (or at least report) the torque scale factor from the calibration.
 * For bandwidth, state the controller gains and whether velocity feedforward was sent, since it
   changes the closed-loop transfer function.
