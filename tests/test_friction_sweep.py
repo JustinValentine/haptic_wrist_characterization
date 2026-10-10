@@ -24,12 +24,23 @@ class FrictionSweepTest(unittest.TestCase):
         # No gravity in the default plant: the conservative torque is ~zero.
         self.assertLess(abs(summary['conservative_offset_nm']), 0.005)
         # The slowest pass resolves the motors' cogging (60 cycles per motor turn in
-        # the simulator). The loop can only be ~80 N m/rad stiff against cogging
-        # that is itself ~14 N m/rad stiff at FE, so part of the ripple becomes
-        # position ripple instead of torque: the amplitude reads ~20% low.
+        # the simulator). Each motor's own torque against its own angle gives its
+        # cogging exactly (quasi-static force balance, whatever the loops do).
         self.assertTrue(summary['cogging_detected'])
-        self.assertLess(rel_err(summary['cogging_amplitude_nm'], truth['cogging_amplitude']), 0.30)
-        self.assertLess(summary['cogging_amplitude_nm'], truth['cogging_amplitude'])
+        params = meta['sim_params']
+        motor_truth = params['cogging_amplitude_motor']
+        for node, amplitude in summary['cogging_motor_amplitudes_nm'].items():
+            i = (6, 7, 8).index(int(node))
+            truth_i = motor_truth[i] if isinstance(motor_truth, list) else motor_truth
+            self.assertLess(rel_err(amplitude, truth_i), 0.10, node)
+        # FE's cogging is the two motors' ripples summed with a phase that moves
+        # 450 rad per rad of UR, so its amplitude belongs to the exact pose:
+        # between N1 |a7 - a8| and N1 (a7 + a8).
+        a7, a8 = (summary['cogging_motor_amplitudes_nm'][n] for n in ('7', '8'))
+        n1 = 7.5077
+        for key in ('cogging_amplitude_nm', 'cogging_amplitude_from_motors_nm'):
+            self.assertGreater(summary[key], 0.8 * n1 * abs(a7 - a8))
+            self.assertLess(summary[key], 1.1 * n1 * (a7 + a8))
         self.assertLess(rel_err(summary['cogging_period_deg'], truth['cogging_period_deg']), 0.01)
         self.assertAlmostEqual(summary['cogging_cycles_per_motor_rev'],
                                truth['cogging_periods_per_motor_rev'], delta=0.5)

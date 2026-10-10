@@ -32,8 +32,9 @@ import pandas as pd
 from scipy import optimize
 
 import device_config
-from analysis_common import (export_figure, fit_sinusoids, load_run, loop_timing, make_parser,
-                             print_header, print_truth_comparison, save_outputs,
+from analysis_common import (cogging_torque, export_figure, fit_sinusoids, latest_cogging_model,
+                             load_run, loop_timing, make_parser, print_header,
+                             print_truth_comparison, run_joint_index, save_outputs,
                              saturation_fraction, sim_truth)
 from ieee_plot import (INK, SERIES, add_panel_label, configure_ieee_style, direct_label,
                        figure_size, log_ticks_hz, ordinal_colors, reference_line, style_axis,
@@ -77,6 +78,48 @@ def estimate_level(frame, freqs, period, discard=1):
     else:
         se = np.full(len(freqs), np.nan)
     return {'H': mean, 'se': se, 'u_amp_deg': np.mean(U, axis=0), 'num_periods': len(H)}
+
+
+def plant_from_measured_torque(levels, cogging=None, joint=None):
+    """The plant's inertia from the motors' measured torque against position at the
+    excited lines: Z = T/Theta = k - J w^2 (- c w^4) + j w b_eq, so Re Z gives J (and a
+    stiffness from cogging or gravity) with no model of the loop, its gains or
+    its delay. Coulomb friction acts in phase with velocity, in Im Z. Returns None
+    without measured torque."""
+    Z_all, w_all = [], []
+    for lv in levels:
+        frame = lv['frame']
+        if 'joint_torque_nm' not in frame or not np.isfinite(frame['joint_torque_nm']).all():
+            return None
+        t = frame['t_local'].to_numpy()
+        theta = np.radians(frame['joint_pos_deg'].to_numpy())
+        tau = frame['joint_torque_nm'].to_numpy(float)
+        if cogging is not None:
+            tau = tau - cogging_torque(cogging, frame, joint)
+        freqs, period = lv['freqs'], lv['period']
+        dt = float(np.median(np.diff(t)))
+        n_periods = int(math.floor((t[-1] + 2 * dt) / period + 1e-9))
+        per = []
+        for k in range(1, n_periods):
+            mask = (t >= k * period) & (t < (k + 1) * period)
+            if mask.sum() < 4 * len(freqs):
+                continue
+            T, _ = fit_sinusoids(t[mask], tau[mask], freqs)
+            X, _ = fit_sinusoids(t[mask], theta[mask], freqs)
+            per.append(T / X)
+        if per:
+            Z_all.append(np.mean(per, axis=0))
+            w_all.append(2.0 * np.pi * freqs)
+    if not Z_all:
+        return None
+    Z, w = np.concatenate(Z_all), np.concatenate(w_all)
+    # The output hangs on a compliant cable, so its apparent inertia grows toward
+    # the transmission resonance: Jo w^2 / (1 - w^2/wo^2) ~ Jo w^2 + (Jo/wo^2) w^4.
+    # The w^4 term takes that out; J is the rigid-body (low-frequency) inertia.
+    A = np.column_stack([np.ones_like(w), -w ** 2, -w ** 4])
+    (k, J, _), *_ = np.linalg.lstsq(A, Z.real, rcond=None)
+    return {'plant_J_kg_m2': float(J), 'plant_stiffness_nm_rad': float(k),
+            'plant_b_equivalent_nms_rad': float(np.median(Z.imag / w))}
 
 
 def legacy_estimate(df, meta):
@@ -370,7 +413,8 @@ def main(argv=None):
                 print(f'Level {level}: no complete period after the transient; skipped.')
                 continue
             levels.append({'level': int(level), 'amplitude_deg': float(frame['amplitude_deg'].iloc[0]),
-                           'freqs': freqs, 'saturation_fraction': saturation_fraction(frame),
+                           'freqs': freqs, 'period': period,
+                           'saturation_fraction': saturation_fraction(frame),
                            'frame': frame, **est})
     if not levels:
         raise SystemExit('No multisine data to analyze.')
@@ -419,6 +463,11 @@ def main(argv=None):
                     if k in ('fit_J_kg_m2', 'fit_b_nms_rad', 'fit_delay_ms', 'fit_rms_error_db')})
     else:
         fit = fit_model(f_fit, H_fit, se_fit, kp, kd, ff)
+    plant = (plant_from_measured_torque(valid_levels, latest_cogging_model(run.simulated),
+                                        run_joint_index(run))
+             if not run.legacy else None)
+    if plant:
+        fit.update(plant)
     times = df['time'].to_numpy()
     sample_rate = float(1.0 / np.median(np.diff(times))) if len(times) > 1 else math.nan
 
@@ -479,6 +528,10 @@ def main(argv=None):
     else:
         print(f"  Bandwidth ({headline_level['amplitude_deg']:g} deg): "
               f"{headline['bandwidth_hz']:.2f} Hz")
+    if 'plant_J_kg_m2' in fit:
+        print(f"  Plant from measured torque (no loop model): J = {fit['plant_J_kg_m2']:.5g} kg m^2, "
+              f"stiffness {fit['plant_stiffness_nm_rad']:.3g} N m/rad, equivalent damping "
+              f"{fit['plant_b_equivalent_nms_rad']:.3g} N m s/rad")
     print(f"  Fit: J = {fit['fit_J_kg_m2']:.5g} kg m^2, b = {fit['fit_b_nms_rad']:.4g} N m s/rad, "
           f"delay = {fit['fit_delay_ms']:.3f} ms, rms error {fit['fit_rms_error_db']:.2f} dB")
     print(f"  (b is an effective damping: it includes friction acting at these amplitudes and "
@@ -488,7 +541,10 @@ def main(argv=None):
     if truth:
         J_true = truth['motor_inertia'] + truth['output_inertia']
         b_true = truth['viscous'] + truth['output_viscous']
-        print_truth_comparison([('Inertia J (FRF fit)', fit['fit_J_kg_m2'], J_true, 'kg m^2')])
+        rows = [('Inertia J (FRF fit)', fit['fit_J_kg_m2'], J_true, 'kg m^2')]
+        if 'plant_J_kg_m2' in fit:
+            rows.insert(0, ('Inertia J (measured torque)', fit['plant_J_kg_m2'], J_true, 'kg m^2'))
+        print_truth_comparison(rows)
         print(f"  Effective b {fit['fit_b_nms_rad']:.3g} N m s/rad is not comparable to the "
               f"viscous truth {b_true:.3g}: Kd and friction dominate the loop damping.")
         tau_true = (loop['delay_s'] + truth['current_loop_time_constant']) if loop else 0.0

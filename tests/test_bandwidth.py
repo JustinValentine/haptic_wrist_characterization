@@ -67,8 +67,9 @@ class BandwidthTest(unittest.TestCase):
 
         kp, kd = summary['kp_joint_nm_rad'], summary['kd_joint_nms_rad']
         J_true = truth['motor_inertia'] + truth['output_inertia']
-        # J and b trade off when Kd dominates the loop damping: J is loose here;
-        # the step response measures it to a few percent.
+        # From the measured torque, with no loop model: J to ~1%.
+        self.assertLess(rel_err(summary['plant_J_kg_m2'], J_true), 0.02)
+        # The closed-loop fit's J and b trade off when Kd dominates the loop damping.
         self.assertLess(rel_err(summary['fit_J_kg_m2'], J_true), 0.15)
         self.assertTrue(summary['fit_delay_fixed'])
         self.assertEqual(summary['num_levels_valid'], summary['num_levels'])

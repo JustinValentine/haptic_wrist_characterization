@@ -1,4 +1,12 @@
-"""Identify J, b, and fc from the P-only step responses.
+"""Identify J, b, and fc from the step responses.
+
+Primary estimate (p4wrist runs with measured current): a rigid-body fit of the
+motors' measured torque against position over the same half-cycles,
+J theta'' + b theta' + fc sign(theta') + tau0 = tau_measured, integrated twice
+(analysis_common.fit_rigid_body). It holds whatever loop produced the torque, so
+it needs no model of the loop's gains or delay. The ring-down method below is
+kept as a cross-check (ringdown_* in the summary).
+
 
 Model (joint side, a = th - th_cmd):  J a'' + b a' + fc sign(a') = -Kp a + tau_bias
 
@@ -35,9 +43,10 @@ from scipy import signal
 
 import device_config
 from experiment_common import latest_summary
-from analysis_common import (bootstrap_ci, correct_for_loop, export_figure, load_run,
-                             loop_delays, make_parser, print_header, print_truth_comparison,
-                             robust_sigma, save_outputs, sim_truth)
+from analysis_common import (bootstrap_ci, cogging_torque, correct_for_loop, export_figure,
+                             fit_rigid_body, latest_cogging_model, load_run, loop_delays,
+                             make_parser, print_header, print_truth_comparison, robust_sigma,
+                             run_joint_index, save_outputs, sim_truth)
 from ieee_plot import (INK, MUTED, TORQUE_UNIT, add_panel_label, configure_ieee_style,
                        figure_size, ordinal_colors, reference_line, style_axis)
 
@@ -225,6 +234,30 @@ def identify(half_cycles, kp, kd=0.0, delays=None):
     }
 
 
+def measured_torque_pieces(half_cycles, frames, cogging, joint):
+    """The usable half-cycles as pieces for fit_rigid_body (empty without measured torque)."""
+    excluded = half_cycles['saturated'] | half_cycles['in_deadband']
+    pieces = []
+    for _, r in half_cycles[~excluded].iterrows():
+        frame = frames.get(r['segment'])
+        if frame is None or 'joint_torque_nm' not in frame:
+            return []
+        t = frame['time'].to_numpy(float) - float(frame['time'].iloc[0])
+        sel = (t >= r['t_n']) & (t <= r['t_n'] + r['half_period_s'])
+        if sel.sum() < 8:
+            continue
+        part = frame[sel]
+        tau = part['joint_torque_nm'].to_numpy(float)
+        if not np.isfinite(tau).all():
+            return []
+        if cogging is not None:
+            tau = tau - cogging_torque(cogging, part, joint)
+        pieces.append({'segment': r['segment'], 't': t[sel],
+                       'theta': np.radians(part['joint_pos_deg'].to_numpy(float)),
+                       'tau': tau, 'direction': r['direction']})
+    return pieces
+
+
 # --- model replay -------------------------------------------------------------------
 def simulate(a0, t, est, kp, static_nm):
     """Piecewise-analytic response from rest at a0 (joint rad, relative to cmd)."""
@@ -361,8 +394,9 @@ def main(argv=None):
     delays = loop_delays(run)
     nominal_period = 2 * math.pi * math.sqrt(device_config.NOMINAL_JOINT_INERTIA_KG_M2 / kp)
 
-    steps, rows = [], []
+    steps, rows, frames = [], [], {}
     for seg_id, frame in step_segments(df):
+        frames[seg_id] = frame
         result = extract_half_cycles(seg_id, frame, kp, nominal_period)
         if result is None:
             print(f'Segment {seg_id}: too few turning points; skipped.')
@@ -381,6 +415,19 @@ def main(argv=None):
     est = identify(half_cycles, kp, kd, delays)
     if est is None:
         raise SystemExit('Identification failed: decay ratio outside (0, 1).')
+
+    # Delay-free estimate from the measured torque over the same half-cycles.
+    cogging = latest_cogging_model(run.simulated)
+    pieces = measured_torque_pieces(half_cycles, frames, cogging, run_joint_index(run))
+    measured = fit_rigid_body(pieces) if pieces else None
+    measured_ci = {}
+    if measured:
+        by_segment = {}
+        for piece in pieces:
+            by_segment.setdefault(piece['segment'], []).append(piece)
+        measured_ci = bootstrap_ci(list(by_segment.values()),
+                                   lambda gs: fit_rigid_body([p for g in gs for p in g]),
+                                   keys=('J_kg_m2', 'b_nms_rad', 'fc_nm'))
 
     static_nm = latest_static_friction(run.simulated)
     static_for_model = static_nm if static_nm else est['fc_nm']
@@ -426,6 +473,8 @@ def main(argv=None):
         **est,
         **{f'{k}_ci95_low': v[0] for k, v in ci.items()},
         **{f'{k}_ci95_high': v[1] for k, v in ci.items()},
+        **{f'ringdown_{k}': est[k] for k in ('J_kg_m2', 'b_nms_rad', 'fc_nm')},
+        'primary_method': 'ring-down (delay-corrected)',
         'kp_joint_nm_rad': kp,
         'kd_joint_nms_rad': kd,
         'loop_delay_position_s': delays['position'],
@@ -438,6 +487,15 @@ def main(argv=None):
         'num_half_cycles_torque_limited': int(half_cycles['torque_limited'].sum()),
         'num_half_cycles_in_deadband': int(half_cycles['in_deadband'].sum()),
     }
+    if measured:
+        # The measured-torque fit needs no loop model: it is the primary estimate.
+        summary.update({k: measured[k] for k in ('J_kg_m2', 'b_nms_rad', 'fc_nm')})
+        summary.update({f'{k}_ci95_low': v[0] for k, v in measured_ci.items()})
+        summary.update({f'{k}_ci95_high': v[1] for k, v in measured_ci.items()})
+        summary.update({'primary_method': 'measured torque (rigid-body fit)',
+                        'measured_bias_torque_nm': measured['bias_torque_nm'],
+                        'measured_num_pieces': measured['num_pieces'],
+                        'cogging_removed': cogging is not None})
     metadata = {
         'analysis': 'step_input_experiment_analysis.py',
         'source_data': str(run.source),
@@ -467,6 +525,14 @@ def main(argv=None):
         lo, hi = ci.get(key, (math.nan, math.nan))
         print(f'  {label:<26} {est[key]:{fmt}} {unit}   95% CI [{lo:{fmt}}, {hi:{fmt}}]')
 
+    if measured:
+        print(f"  Measured torque (rigid-body fit over {measured['num_pieces']} half-cycles, primary):")
+        for label, key, unit in (('Inertia J', 'J_kg_m2', 'kg m^2'),
+                                 ('Viscous damping b', 'b_nms_rad', 'N m s/rad'),
+                                 ('Coulomb friction fc', 'fc_nm', 'N m')):
+            lo, hi = measured_ci.get(key, (math.nan, math.nan))
+            print(f'    {label:<24} {measured[key]:.4g} {unit}   95% CI [{lo:.4g}, {hi:.4g}]')
+        print('  Ring-down (delay-corrected, cross-check):')
     line('Inertia J', 'J_kg_m2', 'kg m^2')
     line('Viscous damping b', 'b_nms_rad', 'N m s/rad')
     line('Damping ratio', 'zeta', '')
@@ -482,13 +548,17 @@ def main(argv=None):
     truth = sim_truth(run)
     if truth:
         rigid = not math.isfinite(truth['transmission_stiffness'])
-        print_truth_comparison([
-            ('Inertia J', est['J_kg_m2'], truth['motor_inertia'] + truth['output_inertia'],
-             'kg m^2'),
-            ('Viscous b', est['b_nms_rad'], truth['viscous'] + truth['output_viscous'],
-             'N m s/rad'),
-            ('Coulomb fc', est['fc_nm'], truth['coulomb'], 'N m'),
-        ])
+        J_true = truth['motor_inertia'] + truth['output_inertia']
+        b_true = truth['viscous'] + truth['output_viscous']
+        rows = []
+        if measured:
+            rows += [('Inertia J (measured torque)', measured['J_kg_m2'], J_true, 'kg m^2'),
+                     ('Viscous b (measured torque)', measured['b_nms_rad'], b_true, 'N m s/rad'),
+                     ('Coulomb fc (measured torque)', measured['fc_nm'], truth['coulomb'], 'N m')]
+        rows += [('Inertia J (ring-down)', est['J_kg_m2'], J_true, 'kg m^2'),
+                 ('Viscous b (ring-down)', est['b_nms_rad'], b_true, 'N m s/rad'),
+                 ('Coulomb fc (ring-down)', est['fc_nm'], truth['coulomb'], 'N m')]
+        print_truth_comparison(rows)
         if not rigid:
             print('  (two-mass plant: J and b are the rigid-body equivalents)')
 

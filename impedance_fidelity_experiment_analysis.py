@@ -43,7 +43,8 @@ import pandas as pd
 from scipy import optimize
 
 import device_config
-from analysis_common import (applied_torque_times, cogging_torque, loop_timing, pwl_fourier, export_figure, fit_sinusoids, latest_cogging_model,
+from analysis_common import (applied_torque_times, cogging_torque, loop_timing, pwl_fourier,
+                             run_joint_index, export_figure, fit_sinusoids, latest_cogging_model,
                              load_run, make_parser, print_header,
                              print_truth_comparison, save_outputs, sim_truth)
 from experiment_common import latest_summary
@@ -75,7 +76,7 @@ def position_column(df):
     return 'joint_pos_deg'
 
 
-def estimate_target(frame, design, column, cogging=None, loop=None):
+def estimate_target(frame, design, column, cogging=None, loop=None, joint=None):
     """Displayed impedance per period at the excited lines; mean and SE.
 
     With a cogging model, the cogging torque at the measured motor position is
@@ -104,7 +105,7 @@ def estimate_target(frame, design, column, cogging=None, loop=None):
         torque = np.array([signal(t)[0] for t in t_local])
         t_torque = t_theta = t_local + 0.5 * lag
     theta = np.radians(frame[column].to_numpy())
-    cog = (cogging_torque(cogging, frame['motor_pos_rev'].to_numpy())
+    cog = (cogging_torque(cogging, frame, joint)
            if cogging is not None and 'motor_pos_rev' in frame else None)
     Z, residual, motion = [], [], []
     for p in range(1, int(design['periods'])):
@@ -470,7 +471,7 @@ def main(argv=None):
     results = []
     for t in targets:
         frame = excite[excite['target_id'] == t['target_id']] if 'target_id' in excite else excite.iloc[0:0]
-        est = (estimate_target(frame, t['design'], column, cogging, loop)
+        est = (estimate_target(frame, t['design'], column, cogging, loop, run_joint_index(run))
                if (not t.get('skipped') and len(frame)) else None)
         results.append({**t, **(est or {}), 'measured': est is not None})
     measured = [r for r in results if r['measured']]

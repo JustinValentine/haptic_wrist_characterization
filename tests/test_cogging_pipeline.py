@@ -29,8 +29,10 @@ class CoggingPipelineTest(unittest.TestCase):
                 runs[name] = run_analysis(analysis, run_dir)
 
         self.assertTrue(sweep['cogging_detected'])
-        # Read low through the loop's finite stiffness (see test_friction_sweep).
-        self.assertLess(rel_err(sweep['cogging_amplitude_nm'], truth['cogging_amplitude']), 0.30)
+        # Per motor, exact (see test_friction_sweep); downstream analyses evaluate
+        # these motor models at their own poses.
+        for amplitude in sweep['cogging_motor_amplitudes_nm'].values():
+            self.assertLess(rel_err(amplitude, 0.002), 0.10)
 
         # Breakaway torque = static friction + cogging at the stuck position: the model
         # collapses the spread the cogging puts into individual breakaways.

@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from analysis_common import (cogging_torque, export_figure, latest_cogging_model, load_run,
+                             run_joint_index,
                              make_parser, print_header, print_truth_comparison, save_outputs,
                              sim_truth)
 from ieee_plot import (INK, LINESTYLES, MUTED, SERIES, TORQUE_UNIT, add_panel_label,
@@ -57,6 +58,7 @@ def level_table(run):
             'deflection_deg': float(group['joint_pos_deg'].mean()),
             'motor_pos_rev': (float(group['motor_pos_rev'].mean())
                               if 'motor_pos_rev' in group else math.nan),
+            **{c: float(group[c].mean()) for c in group.columns if c.startswith('motor_angle_')},
             'num_samples': int(len(group)),
             'previous_nm': level.get('previous_nm', math.nan),
         }
@@ -222,7 +224,7 @@ def main(argv=None):
     cogging = latest_cogging_model(run.simulated)
     table['measured_raw_nm'] = table['measured_nm']
     if cogging is not None and table['motor_pos_rev'].notna().all():
-        table['cogging_nm'] = cogging_torque(cogging, table['motor_pos_rev'])
+        table['cogging_nm'] = cogging_torque(cogging, table, run_joint_index(run))
         table['measured_nm'] = table['measured_raw_nm'] + table['cogging_nm']
     else:
         table['cogging_nm'] = math.nan

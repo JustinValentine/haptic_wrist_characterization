@@ -63,9 +63,12 @@ MAX_MOTOR_TEMPERATURE_C = 90.0      # Needs MOTOR_THERMISTOR below; ignored if a
 MAX_BOARD_TEMPERATURE_C = 75.0      # P4 amplifier temperature (0x3000:02)
 
 # How the library holds the joints not under test (PD about their start angle).
-# The WAM8g profile used kp 20/10/10 N m/rad, kd 0.1 N m s/rad on J6-J8.
-HOLD_KP_NM_RAD = {'PS': 20.0, 'FE': 10.0, 'UR': 10.0}
-HOLD_KD_NMS_RAD = {'PS': 0.1, 'FE': 0.1, 'UR': 0.1}
+# Stiffer than the WAM8g profile (kp 20/10/10 N m/rad, kd 0.1): a held joint
+# softer than its cogging's stiffness (~14 N m/rad at FE/UR in simulation) snaps
+# from detent to detent while the other joint of the differential moves, and that
+# leaks into the joint under test. 40/0.6 is stable even with a 30 Hz velocity filter.
+HOLD_KP_NM_RAD = {'PS': 40.0, 'FE': 40.0, 'UR': 40.0}
+HOLD_KD_NMS_RAD = {'PS': 0.6, 'FE': 0.6, 'UR': 0.6}
 HOLD_MAX_TORQUE_NM = 2.0
 
 # --- p4wrist loop -----------------------------------------------------------------

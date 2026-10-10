@@ -32,7 +32,7 @@ import pandas as pd
 from scipy import optimize
 
 from analysis_common import (applied_torque_times, cogging_torque, export_figure, fit_sinusoids,
-                             latest_cogging_model, load_run, loop_timing, make_parser,
+                             latest_cogging_model, load_run, loop_timing, make_parser, run_joint_index,
                              print_header, print_truth_comparison, pwl_fourier, robust_sigma,
                              save_outputs, sim_truth)
 from ieee_plot import (INK, SERIES, TORQUE_UNIT, add_panel_label, configure_ieee_style,
@@ -392,7 +392,7 @@ def main(argv=None):
     cogging = latest_cogging_model(run.simulated)
     df = df.copy()
     if cogging is not None and 'motor_pos_rev' in df:
-        df['cogging_nm'] = cogging_torque(cogging, df['motor_pos_rev'])
+        df['cogging_nm'] = cogging_torque(cogging, df, run_joint_index(run))
     else:
         df['cogging_nm'] = 0.0
 

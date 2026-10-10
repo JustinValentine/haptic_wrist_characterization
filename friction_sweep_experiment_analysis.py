@@ -36,7 +36,8 @@ import pandas as pd
 from scipy import optimize
 
 import device_config
-from analysis_common import (export_figure, load_run, loop_delays, make_parser, print_header,
+from analysis_common import (cogging_torque, export_figure, load_run, loop_delays, make_parser,
+                             motor_torques, run_j2mp, run_joint_index, run_nodes, print_header,
                              print_truth_comparison, save_outputs, sim_truth)
 from experiment_common import latest_summary
 from ieee_plot import (INK, MUTED, TORQUE_UNIT, add_panel_label, configure_ieee_style,
@@ -288,6 +289,51 @@ def fit_cogging(slow, gear):
     }
 
 
+def fit_motor_cogging(run, passes_df, passes, cpr):
+    """Each moving motor's cogging from its own measured torque against its own angle.
+
+    At cruise speeds this slow the motor is quasi-static: its torque is its own
+    cogging plus its share of friction (a smooth trend per pass, removed), whatever
+    the position loops do. So the per-motor fit holds however stiffly the loops
+    track and however the other joint of the differential moves, where a fit
+    against the joint angle mixes the two motors' phases. Returns None without
+    per-motor currents and angles (moteus runs, unmapped current)."""
+    T, nodes, joint = run_j2mp(run), run_nodes(run), run_joint_index(run)
+    if T is None:
+        return None
+    slow = passes_df[passes_df['speed_deg_s'] <= COGGING_MAX_SPEED_DEG_S]
+    motors, amplitudes = {}, {}
+    for i, node in enumerate(nodes):
+        if T[i][joint] == 0.0:
+            continue
+        ms, ys = [], []
+        for pass_id in slow['pass_id']:
+            frame = passes[int(pass_id)]
+            torques = motor_torques(frame, run.meta)
+            if torques is None or f'motor_angle_{node}' not in frame:
+                return None
+            m = frame[f'motor_angle_{node}'].to_numpy(float) / (2.0 * math.pi)   # motor turns
+            y = torques[node]
+            ok = np.isfinite(m) & np.isfinite(y)
+            m, y = m[ok], y[ok]
+            if len(m) < 50 or np.ptp(m) < COGGING_MIN_SPAN_REV:
+                continue
+            x = m - m.mean()
+            ms.append(m)
+            ys.append(y - np.polyval(np.polyfit(x, y, 3), x))
+        if not ms:
+            continue
+        m_all, y_all = np.concatenate(ms), np.concatenate(ys)
+        X = harmonic_design(m_all, cpr, COGGING_HARMONICS)
+        coef, *_ = np.linalg.lstsq(X, y_all, rcond=None)
+        motors[str(node)] = [[k + 1, float(coef[2 * k]), float(coef[2 * k + 1])]
+                             for k in range(COGGING_HARMONICS)]
+        amplitudes[str(node)] = float(math.hypot(coef[0], coef[1]))
+    if not motors:
+        return None
+    return {'motors': motors, 'amplitudes': amplitudes, 'nodes': nodes, 'j2mp': T}
+
+
 def loop_inertia(run):
     """Joint inertia for the drag model: the newest step-response estimate, else nominal."""
     found = latest_summary('step_response', run.simulated)
@@ -483,6 +529,25 @@ def main(argv=None):
         cog = fit_cogging(slow_cruises(passes_df, passes, column), gear)
     else:
         cog = {'cogging_detected': False, 'cogging_note': 'no motor position column'}
+    if cog['cogging_detected']:
+        per_motor = fit_motor_cogging(run, passes_df, passes, cog['cogging_cycles_per_motor_rev'])
+        if per_motor:
+            cog['cogging_model'].update({'motors': per_motor['motors'], 'nodes': per_motor['nodes'],
+                                         'j2mp': per_motor['j2mp']})
+            cog['cogging_motor_amplitudes_nm'] = per_motor['amplitudes']
+            # The joint's cogging the motor models predict at the sweep's mean pose,
+            # moving only this joint (the other joint of a differential sets the phase
+            # between the two motors' ripples, so this amplitude belongs to that pose).
+            joint, nodes, T = run_joint_index(run), per_motor['nodes'], per_motor['j2mp']
+            n_eff = max(abs(T[i][joint]) for i in range(3))
+            span = 2.0 * math.pi / (cog['cogging_cycles_per_motor_rev'] * n_eff)
+            dq = np.linspace(0.0, span, 400, endpoint=False)
+            pose = {f'motor_angle_{n}': float(df[f'motor_angle_{n}'].mean()) + T[i][joint] * dq
+                    for i, n in enumerate(nodes)}
+            predicted = cogging_torque(cog['cogging_model'], pose, joint)
+            X = harmonic_design(dq * n_eff / (2.0 * math.pi), cog['cogging_cycles_per_motor_rev'], 1)
+            coef, *_ = np.linalg.lstsq(X, predicted, rcond=None)
+            cog['cogging_amplitude_from_motors_nm'] = float(math.hypot(*coef))
     period = cog['cogging_period_deg'] if cog['cogging_detected'] else None
     pair_bin = whole_periods(BIN_DEG, period)
     fine_bin = whole_periods(FINE_BIN_DEG, period)
@@ -706,6 +771,14 @@ def main(argv=None):
                       truth.get('cogging_amplitude'), 'N m'),
                      ('Cogging period', cog['cogging_period_deg'],
                       truth.get('cogging_period_deg'), 'deg')]
+        if 'cogging_amplitude_from_motors_nm' in cog:
+            rows.append(('Cogging (from motor models)', cog['cogging_amplitude_from_motors_nm'],
+                         truth.get('cogging_amplitude'), 'N m'))
+        motor_truth = (run.meta.get('sim_params') or {}).get('cogging_amplitude_motor')
+        for node, amplitude in (cog.get('cogging_motor_amplitudes_nm') or {}).items():
+            i = run_nodes(run).index(int(node))
+            value = motor_truth[i] if isinstance(motor_truth, (list, tuple)) else motor_truth
+            rows.append((f'Cogging, motor {node}', amplitude, value, 'N m'))
         print_truth_comparison(rows)
 
     fig = plot_velocity(used, fit)

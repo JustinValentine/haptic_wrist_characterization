@@ -21,6 +21,7 @@ class Run:
     out_dir: Path
     source: Path
     legacy: bool
+    timing: dict = None
 
     @property
     def simulated(self):
@@ -97,7 +98,50 @@ def load_run(experiment, path=None, legacy_names=()):
     if 'experiment' not in meta or 'device_config' not in meta:
         legacy = True
     out_dir.mkdir(parents=True, exist_ok=True)
-    return Run(df=df, meta=meta, out_dir=out_dir, source=csv, legacy=legacy)
+    run = Run(df=df, meta=meta, out_dir=out_dir, source=csv, legacy=legacy)
+    run.timing = timing_quality(run)
+    return run
+
+
+# Timing quality of a p4wrist run: data from a loop that ran late or lost
+# positions is not what the protocol assumes.
+MAX_LATE_FRACTION = 0.01
+
+
+def timing_quality(run):
+    """Late cycles, missed positions, gaps and log overflow, with a printed warning."""
+    df = run.df
+    if 'late_ms' not in df or 'loop_cycle' not in df:
+        return None
+    period_ms = 1000.0 * float((run.meta.get('p4wrist_config') or {}).get('period_s', 0.002))
+    late = df['late_ms'].to_numpy(float)
+    cycles = df['loop_cycle'].to_numpy()
+    t = df['time'].to_numpy(float)
+    consecutive = np.diff(cycles) == 1
+    gaps = 1000.0 * np.diff(t)[consecutive] if len(t) > 1 else np.zeros(0)
+    overflow = sum(e.get('dropped', 0) for e in run.meta.get('events', [])
+                   if e.get('event') == 'log_overflow')
+    quality = {
+        'late_fraction': float(np.mean(late > 0.5 * period_ms)),
+        'max_late_ms': float(np.nanmax(late)) if len(late) else 0.0,
+        'missed_feedback_cycles': int(np.count_nonzero(df['missed_feedback'].to_numpy())),
+        'max_gap_ms': float(gaps.max()) if len(gaps) else 0.0,
+        'log_overflow_cycles': int(overflow),
+    }
+    problems = []
+    if quality['late_fraction'] > MAX_LATE_FRACTION:
+        problems.append(f"{100 * quality['late_fraction']:.1f}% of cycles started late")
+    if quality['missed_feedback_cycles']:
+        problems.append(f"{quality['missed_feedback_cycles']} cycles missed a position")
+    if quality['max_gap_ms'] > 1.5 * period_ms:
+        problems.append(f"a {quality['max_gap_ms']:.1f} ms gap between cycles")
+    if quality['log_overflow_cycles']:
+        problems.append(f"{quality['log_overflow_cycles']} cycles lost to a full log")
+    quality['clean'] = not problems
+    if problems:
+        print('WARNING: loop timing in this run: ' + '; '.join(problems)
+              + '. Check real-time scheduling before trusting time-sensitive results.')
+    return quality
 
 
 def sim_truth(run):
@@ -135,6 +179,8 @@ def save_outputs(run, tables=None, summary=None, metadata=None, prefix=''):
         table.to_csv(path, index=False)
         paths[name] = str(path)
     if summary is not None:
+        if run.timing:
+            summary = {**summary, **{f'timing_{k}': v for k, v in run.timing.items()}}
         path = run.out_dir / f'{prefix}summary.csv'
         pd.DataFrame([summary]).to_csv(path, index=False)
         write_json(run.out_dir / f'{prefix}summary.json', summary)
@@ -195,6 +241,55 @@ def applied_torque_times(time, loop):
     """When each loop cycle's torque target is fully applied: the CST ramp ends
     loop_delay after the cycle (2 SYNC periods), in the cycle's own time base."""
     return np.asarray(time, dtype=float) + loop['delay_s']
+
+
+def fit_rigid_body(pieces):
+    """J, b, fc and a bias torque from measured torque and position: no controller model.
+
+    pieces: dicts with t (s), theta (rad), tau (joint N m: measured motor torque,
+    cogging already removed if modeled) and direction (+1/-1, the sign of the
+    velocity throughout the piece, e.g. one half-cycle of a ring-down). Per piece,
+
+        J theta'' + b theta' + fc d + tau0 = tau
+
+    integrated twice from the piece's start (its start velocity is a free
+    parameter per piece), so positions are never differentiated:
+
+        I2[tau] = J (theta - theta_0) - J v_0 t + b I1[theta - theta_0] + (fc d + tau0) t^2/2.
+
+    tau is integrated as piecewise linear between samples (a P4's torque ramps
+    between SYNCs). Whatever loop produced the torque, and with whatever delay,
+    the equation of motion holds for the torque the motors delivered.
+    Returns None if fewer than 4 pieces or not both directions.
+    """
+    from scipy.integrate import cumulative_trapezoid
+    pieces = [p for p in pieces if len(p['t']) >= 8]
+    if len(pieces) < 4 or len({int(np.sign(p['direction'])) for p in pieces}) < 2:
+        return None
+    n = len(pieces)
+    rows_A, rows_y = [], []
+    for k, piece in enumerate(pieces):
+        t = np.asarray(piece['t'], float) - float(piece['t'][0])
+        theta = np.asarray(piece['theta'], float) - float(piece['theta'][0])
+        tau = np.asarray(piece['tau'], float)
+        i1 = cumulative_trapezoid(tau, t, initial=0.0)
+        i2 = cumulative_trapezoid(i1, t, initial=0.0)
+        p1 = cumulative_trapezoid(theta, t, initial=0.0)
+        A = np.zeros((len(t), 4 + 2 * n))
+        A[:, 0] = theta
+        A[:, 1] = p1
+        A[:, 2] = np.sign(piece['direction']) * t ** 2 / 2.0
+        A[:, 3] = t ** 2 / 2.0
+        A[:, 4 + 2 * k] = -t          # J v_0 of this piece
+        A[:, 5 + 2 * k] = 1.0         # absorbs noise in theta_0 and tau at t = 0
+        rows_A.append(A)
+        rows_y.append(i2)
+    A, y = np.vstack(rows_A), np.concatenate(rows_y)
+    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    J, b, fc, tau0 = (float(c) for c in coef[:4])
+    residual = y - A @ coef
+    return {'J_kg_m2': J, 'b_nms_rad': b, 'fc_nm': fc, 'bias_torque_nm': tau0,
+            'num_pieces': n, 'residual_rms': float(np.sqrt(np.mean(residual ** 2)))}
 
 
 def correct_for_loop(J_app, b_app, kp, kd, delays):
@@ -334,20 +429,80 @@ def saturation_fraction(df, cap_column='max_torque_nm', torque_column='control_j
     return float((torque[valid] >= threshold * cap[valid]).mean())
 
 
-# --- cogging -------------------------------------------------------------------------
-def cogging_torque(model, motor_rev):
-    """Cogging torque (joint N m) that a cogging model predicts at absolute motor positions.
+# --- p4wrist runs ------------------------------------------------------------------
+def run_joint_index(run):
+    """Index (PS 0, FE 1, UR 2) of the joint a run characterized."""
+    dev = run.meta.get('device_config') or {}
+    if 'JOINT_INDEX' in dev:
+        return int(dev['JOINT_INDEX'])
+    names = dev.get('JOINT_NAMES') or ('PS', 'FE', 'UR')
+    return list(names).index(dev.get('JOINT', 'PS')) if dev.get('JOINT') in names else 0
 
-    model: {'periods_per_motor_rev': P, 'harmonics': [[k, a_k, b_k], ...]}, as saved by
-    friction_sweep_experiment_analysis.py, so that
-        torque = sum_k a_k cos(2 pi k P m) + b_k sin(2 pi k P m),  m in motor revolutions.
-    The model is tied to the controller's motor position: re-run the friction sweep after
-    re-zeroing the encoder.
+
+def run_nodes(run):
+    return list((run.meta.get('device_config') or {}).get('NODES', (6, 7, 8)))
+
+
+def run_j2mp(run):
+    return (run.meta.get('device_config') or {}).get('J2MP')
+
+
+def motor_torques(frame, meta):
+    """Each motor's measured torque (N m, in the motor frame of J2MP) from its q-axis
+    current, keyed by node; None when currents or drive data are missing."""
+    info = meta.get('drive_info')
+    config = meta.get('p4wrist_config') or {}
+    nodes = list((meta.get('device_config') or {}).get('NODES', (6, 7, 8)))
+    if not info or not config:
+        return None
+    factor = float(config.get('current_torque_factor', 1.0 / math.sqrt(2.0)))
+    signs = config.get('torque_sign', [1.0, 1.0, 1.0])
+    out = {}
+    for i, node in enumerate(nodes):
+        column = f'current_{node}_a'
+        if column not in frame:
+            return None
+        out[node] = (signs[i] * frame[column].to_numpy(float) * info[i]['kt_mnm_per_a'] / 1000.0
+                     * factor)
+    return out
+
+
+# --- cogging -------------------------------------------------------------------------
+def cogging_torque(model, data, joint=None):
+    """Cogging torque (joint N m) a cogging model predicts.
+
+    Two kinds of model, as friction_sweep_experiment_analysis.py saves them:
+    * per motor ('motors': {node: [[k, a_k, b_k], ...]}, with 'j2mp' and 'nodes'):
+      each motor's c_i(m) = sum_k a_k cos(k P m) + b_k sin(k P m) in its own zeroed
+      angle m (rad, data columns motor_angle_<node>), mapped to `joint` as
+      sum_i J2MP[i][joint] c_i(m_i). Valid at any pose and for any joint.
+    * joint level ('harmonics'): torque = sum_k a_k cos(2 pi k P x) + b_k sin(...)
+      with x the joint angle in motor turns (motor_pos_rev): valid for the joint
+      and the pose of the sweep that made it.
+    data: a DataFrame (or dict of arrays) with those columns, or motor_pos_rev values.
     """
-    m = np.asarray(motor_rev, dtype=float)
-    out = np.zeros_like(m)
+    P = model['periods_per_motor_rev']
+    is_table = isinstance(data, dict) or hasattr(data, 'columns')
+    if model.get('motors') and is_table and joint is not None:
+        nodes = model['nodes']
+        if all(f'motor_angle_{n}' in data for n in nodes):
+            T = model['j2mp']
+            out = None
+            for i, node in enumerate(nodes):
+                terms = model['motors'].get(str(node)) or model['motors'].get(node)
+                if not terms or T[i][joint] == 0.0:
+                    continue
+                m = np.asarray(data[f'motor_angle_{node}'], dtype=float)
+                c = np.zeros_like(m)
+                for k, a, b in terms:
+                    c += a * np.cos(k * P * m) + b * np.sin(k * P * m)
+                out = T[i][joint] * c if out is None else out + T[i][joint] * c
+            if out is not None:
+                return out
+    x = np.asarray(data['motor_pos_rev'] if is_table else data, dtype=float)
+    out = np.zeros_like(x)
     for k, a, b in model['harmonics']:
-        arg = 2.0 * math.pi * k * model['periods_per_motor_rev'] * m
+        arg = 2.0 * math.pi * k * P * x
         out += a * np.cos(arg) + b * np.sin(arg)
     return out
 

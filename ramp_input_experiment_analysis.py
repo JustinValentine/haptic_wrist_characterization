@@ -33,6 +33,7 @@ import pandas as pd
 from scipy import stats
 
 from analysis_common import (cogging_torque, export_figure, latest_cogging_model, load_run,
+                             run_joint_index,
                              make_parser, mean_std_ci, print_header, print_truth_comparison,
                              robust_sigma, save_outputs, sim_truth)
 from ieee_plot import (INK, MUTED, TORQUE_UNIT, add_panel_label, configure_ieee_style,
@@ -204,6 +205,8 @@ def detect_breakaway(ramp_id, ramp, kp, threshold_deg):
                                       if 'joint_torque_nm' in ramp.columns else math.nan),
         'motor_pos_rev': (float(np.interp(t0, t, ramp['motor_pos_rev'].to_numpy()))
                           if 'motor_pos_rev' in ramp.columns else math.nan),
+        **{c: float(np.interp(t0, t, ramp[c].to_numpy())) for c in ramp.columns
+           if c.startswith('motor_angle_')},
     })
     return result
 
@@ -365,7 +368,7 @@ def main(argv=None):
     events['breakaway_torque_nm'] = events['torque_nm']
     cogging = latest_cogging_model(run.simulated)
     if cogging is not None and events['motor_pos_rev'].notna().all():
-        events['cogging_nm'] = cogging_torque(cogging, events['motor_pos_rev'])
+        events['cogging_nm'] = cogging_torque(cogging, events, run_joint_index(run))
         events['torque_nm'] = events['direction'] * (events['torque_signed_nm']
                                                      - events['cogging_nm'])
     else:
