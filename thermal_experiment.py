@@ -10,8 +10,9 @@ continuous torque rating) alongside the peak torque cap.
 Between levels the motor cools at zero torque. Each level stops early when
 the temperature rise or the absolute temperature approaches its limit.
 
-Uses moteus MOTOR_TEMPERATURE (needs a motor thermistor). Without one the
-board temperature is used instead, which rates the driver, not the motor.
+Uses the motor thermistor (P4 0x3010:03, converted by device_config.MOTOR_THERMISTOR).
+Without it the P4 amplifier temperature is used instead, which rates the
+driver, not the motor.
 
 Run:  python thermal_experiment.py [--sim] [--quick]
 """
@@ -21,11 +22,11 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 import device_config
-from experiment_common import (Command, MoteusSession, SafetyLimits, Segment, confirm,
+from experiment_common import (Command, WristSession, SafetyLimits, Segment, confirm,
                                describe_plan, hold, make_arg_parser, run_cli)
 
 EXPERIMENT = 'thermal'
-SIM_PARAMS = None   # Tests inject a moteus_sim.SimParams here.
+SIM_PARAMS = None   # Tests inject a p4_sim.SimParams here.
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
@@ -63,8 +64,8 @@ def choose_channel(rows):
     if ok.mean() > 0.9:
         return 'motor_temp_c', float(np.nanmedian(motor)), device_config.MAX_MOTOR_TEMPERATURE_C
     print('\n' + '!' * 72)
-    print('WARNING: no usable motor temperature (MOTOR_TEMPERATURE). Falling back to the')
-    print('moteus BOARD temperature. This rates the driver, NOT the motor winding.')
+    print('WARNING: no usable motor temperature (set device_config.MOTOR_THERMISTOR). Falling')
+    print('back to the P4 AMPLIFIER temperature. This rates the driver, NOT the motor winding.')
     print('!' * 72 + '\n')
     return 'board_temp_c', float(np.nanmedian(board)), device_config.MAX_BOARD_TEMPERATURE_C
 
@@ -102,7 +103,7 @@ def plan_checks(cfg):
     if not cfg.torque_fractions or max(cfg.torque_fractions) > 1.0 or min(cfg.torque_fractions) <= 0:
         raise SystemExit('torque_fractions must be in (0, 1].')
     if cfg.sample_rate_hz < 2.5 / device_config.WATCHDOG_TIMEOUT_S:
-        raise SystemExit('sample_rate_hz is too low for the moteus watchdog '
+        raise SystemExit('sample_rate_hz is too low for the p4wrist watchdog '
                          f'({device_config.WATCHDOG_TIMEOUT_S} s).')
     levels = torque_levels(cfg)
     worst = cfg.baseline_s + len(levels) * cfg.hold_s + (len(levels) - 1) * cfg.cool_s
@@ -122,7 +123,7 @@ async def main(args):
     plan = [hold(cfg.baseline_s, phase='baseline', **torque_only)]
     plan += [Segment('heat', cfg.hold_s, lambda t, _, tq=tq: Command(torque_nm=tq, **torque_only))
              for tq in levels]
-    async with MoteusSession(EXPERIMENT, args, 0.0, 0.0, config=asdict(cfg),
+    async with WristSession(EXPERIMENT, args, 0.0, 0.0, config=asdict(cfg),
                              rate_hz=cfg.sample_rate_hz, sim_params=SIM_PARAMS,
                              limits=limits) as session:
         session.require_locked_output(

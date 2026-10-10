@@ -36,7 +36,7 @@ import pandas as pd
 from scipy import optimize
 
 import device_config
-from analysis_common import (export_figure, load_run, make_parser, print_header,
+from analysis_common import (export_figure, load_run, loop_delays, make_parser, print_header,
                              print_truth_comparison, save_outputs, sim_truth)
 from experiment_common import latest_summary
 from ieee_plot import (INK, MUTED, TORQUE_UNIT, add_panel_label, configure_ieee_style,
@@ -63,7 +63,7 @@ COGGING_HARMONICS = 3              # Harmonics in the cogging model
 COGGING_MIN_SNR = 10.0             # Spectral peak over the band median for a detection
 COGGING_PHASE_BINS = 24            # Phase bins for the folded cogging waveform
 COGGING_MIN_SPAN_REV = 0.05        # Shortest slow pass used for the cogging fit
-VELOCITY_FILTER_HZ = 400.0         # moteus velocity-estimate bandwidth seen by Kd
+VELOCITY_FILTER_HZ = 400.0         # moteus velocity-estimate bandwidth (runs without loop data)
 MAX_DRAG_FRACTION = 0.2            # Passes whose predicted cogging drag exceeds this
                                    # fraction of their friction are left out of the fit
 
@@ -300,23 +300,29 @@ def loop_inertia(run):
                          device_config.NOMINAL_JOINT_INERTIA_KG_M2)), 'nominal'
 
 
-def cogging_drag(speed_rad_s, cog, kp, kd, inertia):
+def cogging_drag(speed_rad_s, cog, kp, kd, inertia, filter_hz=VELOCITY_FILTER_HZ, delays=None):
     """Mean torque the position loop draws from the cogging ripple at a cruise speed.
 
     Linearized about the cruise, cogging harmonic h, A_h sin(h k x), forces a ripple at
-    w = h k v against the loop's dynamic stiffness Z(jw) = Kp - J w^2 + jw Kd H(jw), with
-    H the velocity-filter lag. The mean extra torque is A_h^2 (h k)^2 v Re{Kd H} / (2|Z|^2),
-    the energy the loop's damping dissipates per unit travel: it grows like viscous
-    friction at low speed and peaks where h k v nears the loop's resonance.
+    w = h k v against the loop's dynamic stiffness Z(jw) = Kp P(jw) - J w^2 + jw Kd H(jw),
+    with P the spring's delay and H the velocity path (filter, and for the p4wrist loop
+    its delay). The mean extra torque is A_h^2 (h k)^2 v Re{jw Z_loop}/(w |Z|^2) with the
+    loop's dissipative part: the energy it dissipates per unit travel. It grows like
+    viscous friction at low speed and peaks where h k v nears the loop's resonance.
     """
+    delays = delays or {'position': 0.0, 'velocity': 0.0}
     k = 2.0 * math.pi / math.radians(cog['cogging_period_deg'])
     v = abs(speed_rad_s)
     total = 0.0
     for h, a, b in cog['cogging_model']['harmonics']:
         w = h * k * v
-        lag = 1.0 / (1.0 + 1j * w / (2.0 * math.pi * VELOCITY_FILTER_HZ))
-        z = kp - inertia * w ** 2 + 1j * w * kd * lag
-        total += (a * a + b * b) * (h * k) ** 2 * v * (kd * lag).real / (2.0 * abs(z) ** 2)
+        lag = np.exp(-1j * w * delays['velocity']) / (1.0 + 1j * w / (2.0 * math.pi * filter_hz))
+        spring = kp * np.exp(-1j * w * delays['position'])
+        z = spring - inertia * w ** 2 + 1j * w * kd * lag
+        # Dissipative part of the loop's torque per unit velocity (the delayed
+        # spring adds -Kp sin(w Tp)/w, which can be negative).
+        damping = (kd * lag).real + (spring.imag / w if w > 0 else 0.0)
+        total += (a * a + b * b) * (h * k) ** 2 * v * damping / (2.0 * abs(z) ** 2)
     return total
 
 
@@ -526,9 +532,11 @@ def main(argv=None):
     kp = float(run.meta_value('kp_joint_nm_rad', column='kp_joint_nm_rad'))
     kd = float(run.meta_value('kd_joint_nms_rad', column='kd_joint_nms_rad'))
     inertia, inertia_source = loop_inertia(run)
+    filter_hz = float(run.meta.get('velocity_filter_hz') or VELOCITY_FILTER_HZ)
+    delays = loop_delays(run)
     if cog['cogging_detected']:
         drag = passes_df['speed_meas_deg_s'].apply(
-            lambda s: cogging_drag(math.radians(s), cog, kp, kd, inertia))
+            lambda s: cogging_drag(math.radians(s), cog, kp, kd, inertia, filter_hz, delays))
     else:
         drag = pd.Series(0.0, index=passes_df.index)
     raw = passes_df['friction_raw_nm']
@@ -641,12 +649,12 @@ def main(argv=None):
                          f'{MAX_DRAG_FRACTION:g} of their friction are left out of the fit'),
         'cogging_drag_inertia_kg_m2': inertia,
         'cogging_drag_inertia_source': inertia_source,
-        'velocity_filter_hz': VELOCITY_FILTER_HZ,
+        'velocity_filter_hz': filter_hz,
         'ripple_trend_order': trend_order,
         'drop_fraction': DROP_FRACTION,
         'settle_periods': SETTLE_PERIODS,
         'settle_time_s': settle_s,
-        'note': ('Torques are in the torque scale moteus reports; multiply by the torque '
+        'note': ('Torques are in the torque scale the drives report; multiply by the torque '
                  'calibration ratio if one was measured. Bins span whole cogging periods, so '
                  'the ripple excludes cogging, which is reported separately; '
                  'ripple_std_corrected_nm removes the noise floor estimated from the scatter '

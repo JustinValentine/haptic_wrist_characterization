@@ -31,9 +31,10 @@ import numpy as np
 import pandas as pd
 from scipy import optimize
 
-from analysis_common import (cogging_torque, export_figure, fit_sinusoids, latest_cogging_model,
-                             load_run, make_parser, print_header, print_truth_comparison,
-                             robust_sigma, save_outputs, sim_truth)
+from analysis_common import (applied_torque_times, cogging_torque, export_figure, fit_sinusoids,
+                             latest_cogging_model, load_run, loop_timing, make_parser,
+                             print_header, print_truth_comparison, pwl_fourier, robust_sigma,
+                             save_outputs, sim_truth)
 from ieee_plot import (INK, SERIES, TORQUE_UNIT, add_panel_label, configure_ieee_style,
                        direct_label, figure_size, log_ticks_hz, reference_line, style_axis,
                        zero_line)
@@ -86,10 +87,18 @@ def zero_crossing_angles(c):
     tau = c['tau'].to_numpy()
     th = c['theta'].to_numpy()
     rising, falling = [], []
-    for i in np.where(np.sign(tau[:-1]) * np.sign(tau[1:]) < 0)[0]:
-        frac = -tau[i] / (tau[i + 1] - tau[i])
-        angle = th[i] + frac * (th[i + 1] - th[i])
-        (rising if tau[i + 1] > tau[i] else falling).append(angle)
+    # Between consecutive nonzero samples of opposite sign. Samples exactly at
+    # zero (a regular sample clock hits the triangle's zero) are the crossing.
+    nonzero = np.flatnonzero(tau != 0)
+    for i, j in zip(nonzero[:-1], nonzero[1:]):
+        if np.sign(tau[i]) == np.sign(tau[j]):
+            continue
+        if j == i + 1:
+            frac = -tau[i] / (tau[j] - tau[i])
+            angle = th[i] + frac * (th[j] - th[i])
+        else:
+            angle = float(np.mean(th[i + 1:j]))
+        (rising if tau[j] > tau[i] else falling).append(angle)
     return np.array(rising), np.array(falling)
 
 
@@ -173,7 +182,7 @@ def zoh_fourier(starts, values, freqs, t_start, t_end):
     return (2.0 / (t_end - t_start)) * (values[:-1] @ E)
 
 
-def compliance_frf(df, design):
+def compliance_frf(df, design, loop=None):
     """Compliance theta/tau at the excited lines, one estimate per period.
 
     moteus applies each torque command when it arrives and holds it until the
@@ -181,27 +190,40 @@ def compliance_frf(df, design):
     the midpoint of the command/reply round trip. The torque is therefore a
     piecewise-constant signal (Fourier coefficients integrated exactly) and
     the position is sampled at the arrival times (least-squares sinusoid fit).
+
+    p4wrist rows are loop cycles (loop from analysis_common.loop_timing): the
+    position is sampled at the cycle's SYNC and the cycle's torque target is
+    reached by a linear ramp ending loop_delay later, so the torque is
+    piecewise linear (its Fourier coefficients are integrated exactly too).
     """
     m = df[df['phase'] == 'multisine']
     if m.empty or not design:
         return None
     freqs = np.asarray(design['freqs_hz'])
     period = design['period_s']
-    arrive = 0.5 * (m['t_send'].to_numpy() + m['time'].to_numpy())
-    arrive = arrive - arrive[0]
     torque = m['cmd_ff_torque_nm'].to_numpy()
     cogging = m['cogging_nm'].to_numpy()
     theta = np.radians(m['joint_pos_deg'].to_numpy())
+    if loop:
+        t_theta = m['time'].to_numpy()
+        t_theta = t_theta - t_theta[0]
+        t_torque = applied_torque_times(t_theta, loop)
+        torque_fourier = pwl_fourier
+    else:
+        t_theta = 0.5 * (m['t_send'].to_numpy() + m['time'].to_numpy())
+        t_theta = t_theta - t_theta[0]
+        t_torque = t_theta
+        torque_fourier = zoh_fourier
     per_period = []
-    for p in range(1, int(arrive[-1] // period)):      # Period 0 is the transient
+    for p in range(1, int(t_theta[-1] // period)):      # Period 0 is the transient
         t0, t1 = p * period, (p + 1) * period
-        sel = (arrive >= t0) & (arrive < t1)
-        if sel.sum() < 10:
+        sel = (t_theta >= t0) & (t_theta < t1)
+        if sel.sum() < 10 or t_torque[-1] < t1:
             continue
-        T = zoh_fourier(arrive, torque, freqs, t0, t1)
+        T = torque_fourier(t_torque, torque, freqs, t0, t1)
         if np.any(cogging[sel]):
-            T = T - fit_sinusoids(arrive[sel], cogging[sel], freqs)[0]
-        X, _ = fit_sinusoids(arrive[sel], theta[sel], freqs)
+            T = T - fit_sinusoids(t_theta[sel], cogging[sel], freqs)[0]
+        X, _ = fit_sinusoids(t_theta[sel], theta[sel], freqs)
         per_period.append(X / T)
     if len(per_period) < 2:
         return None
@@ -326,7 +348,7 @@ def plot_timeseries(df):
     ax_t.plot(df['time'], df['cmd_ff_torque_nm'], color=INK, linewidth=0.6, label='Commanded')
     if 'joint_torque_nm' in df:
         ax_t.plot(df['time'], df['joint_torque_nm'], color=SERIES[1], linewidth=0.4,
-                  label='moteus reported')
+                  label='drive reported')
     ax_d.plot(df['time'], 1e3 * np.radians(df['joint_pos_deg']), color=INK, linewidth=0.6)
     if 'output_joint_raw_deg' in df:
         out = np.radians(df['output_joint_raw_deg'] - df['output_joint_raw_deg'].iloc[0])
@@ -375,7 +397,7 @@ def main(argv=None):
         df['cogging_nm'] = 0.0
 
     c, loop = analyze_loop(df, period, test_torque)
-    frf = compliance_frf(df, design)
+    frf = compliance_frf(df, design, loop_timing(run))
     fit = fit_compliance(frf) if frf is not None else {}
     noise = robust_sigma(np.diff(np.radians(df[df['phase'] == 'dwell']['joint_pos_deg']))) / math.sqrt(2)
 
@@ -399,7 +421,7 @@ def main(argv=None):
                    'of motor angle at the arrival times, weighted fit of 1/(Jm s^2 + c s + k)'),
         'note': ('Angles are motor-encoder angles divided by GEAR_RATIO with the output '
                  'clamped, i.e. cable stretch plus lost motion, joint-referred. Torques are '
-                 'in the torque scale moteus reports.'),
+                 'in the torque scale the drives report.'),
     }
     tables = {'loop': c[['time', 't_local', 'cycle_index', 'rising', 'loading', 'tau', 'theta']]}
     if frf is not None:

@@ -24,30 +24,34 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 import device_config
-from experiment_common import (Command, MoteusSession, SafetyLimits, Segment, confirm,
+from experiment_common import (Command, WristSession, SafetyLimits, Segment, confirm,
                                describe_plan, hold, make_arg_parser, min_jerk, run_cli)
 
 EXPERIMENT = 'transmission'
-SIM_PARAMS = None   # Tests inject a moteus_sim.SimParams here.
+SIM_PARAMS = None   # Tests inject a p4_sim.SimParams here.
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class TransmissionConfig:
-    test_torque_fraction: float = 0.5       # Peak cycle torque as a fraction of MAX_JOINT_TORQUE_NM
+    # Peak cycle torque as a fraction of MAX_JOINT_TORQUE_NM. High, because one P4
+    # motor count is ~0.3 N m of cable torque at FE (0.0117 deg at ~1500 N m/rad).
+    test_torque_fraction: float = 0.8
     cycle_period_s: float = 8.0             # One 0 -> +T -> -T -> 0 cycle (quasi-static)
     cycles: int = 3
-    dynamic: bool = True                    # Run the multisine phase
+    # Multisine phase. Off by default on the P4 wrist: its motion is below one count
+    # of the 4096-count motor encoders (see plan_checks); the static loops still work.
+    dynamic: bool = False
     preload_fraction: float = 0.3           # Multisine offset, fraction of the cycle torque
     multisine_amplitude_fraction: float = 0.15   # Multisine peak, fraction of the cycle torque
     multisine_period_s: float = 2.0         # Frequency resolution = 1 / period
     multisine_periods: int = 6              # The first period is discarded as transient
     freq_min_hz: float = 1.0
-    freq_max_hz: float = 200.0
+    freq_max_hz: float = 200.0              # Past the locked-output resonance; Nyquist is 250 Hz
     num_lines: int = 40                     # Log-spaced excited frequencies
     max_deflection_deg: float = 3.0         # Motor-side joint angle; more means the lock slipped
     max_speed_deg_s: float = 600.0          # Resonance can be lively; a slipped lock is faster
-    sample_rate_hz: float = 1000.0
+    sample_rate_hz: float = 500.0
 
 
 QUICK = dict(cycles=2, cycle_period_s=4.0, multisine_periods=4)
@@ -161,6 +165,15 @@ def plan_checks(cfg):
             print(f'NOTE: freq_max_hz limited to {cfg.sample_rate_hz / 2.5:.0f} Hz by the '
                   'sample rate.')
     k_guess = 1000.0   # N m/rad, only for the printed estimate
+    count_deg = 360.0 / (4096 * device_config.GEAR_RATIO)   # one motor count at the joint
+    if cfg.dynamic:
+        amplitude = cfg.multisine_amplitude_fraction * test_torque
+        motion_deg = math.degrees(amplitude / k_guess)
+        if motion_deg < 5 * count_deg:
+            print(f'WARNING: the multisine moves the joint ~{motion_deg:.4f} deg against a stiff '
+                  f'cable, {motion_deg / count_deg:.1f} motor counts ({count_deg:.4f} deg each): '
+                  'too little for the dynamic fit. Raise multisine_amplitude_fraction or '
+                  'test with an output encoder.')
     lines = [f'  Cycle torque +/-{test_torque:.2f} N m; expected deflection about '
              f'{math.degrees(test_torque / k_guess):.2f} deg at {k_guess:.0f} N m/rad.',
              f'  The run stops if the joint moves more than {cfg.max_deflection_deg} deg '
@@ -176,7 +189,7 @@ async def main(args):
     limits = SafetyLimits(joint_min_deg=-cfg.max_deflection_deg,
                           joint_max_deg=cfg.max_deflection_deg,
                           max_joint_velocity_deg_s=cfg.max_speed_deg_s)
-    async with MoteusSession(EXPERIMENT, args, 0.0, 0.0, config=asdict(cfg),
+    async with WristSession(EXPERIMENT, args, 0.0, 0.0, config=asdict(cfg),
                              rate_hz=cfg.sample_rate_hz, sim_params=SIM_PARAMS,
                              limits=limits) as session:
         session.require_locked_output(

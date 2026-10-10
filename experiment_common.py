@@ -1,18 +1,25 @@
-"""Shared infrastructure for the moteus characterization experiments.
+"""Shared infrastructure for the P4 wrist characterization experiments.
 
 Conventions
 -----------
-* moteus is configured with motor_position.rotor_to_output_ratio = 1, so
-  moteus positions are motor revolutions and torques are motor-side N m.
-  device_config.GEAR_RATIO converts to the joint: joint rev = motor rev / N,
-  joint torque ~= N * motor torque (ideal, before cable losses).
-* Joint positions are relative to the motor position at experiment start.
+* The wrist is driven through the p4wrist library (p4wrist/): a 500 Hz
+  CANopen SYNC loop that renders PD + feedforward per joint, maps joint
+  torques through the PS/FE/UR differential, and supervises limits and
+  liveness itself. device_config.JOINT is characterized; the loop holds the
+  other two joints at their start angles.
+* Joint positions are relative to the start pose of each run. The loop's
+  absolute joint angles (after zeroing) are logged too (q_ps_deg, ...).
+* motor_pos_rev is the joint angle in motor turns (GEAR_RATIO x joint turns):
+  each differential motor turns N1 times per FE or UR turn, so cogging, which
+  is periodic in each motor's angle, stays periodic in this coordinate.
 * Experiments describe what to command as a list of Segments: functions of
   time (and of the last measurement, for host-side feedback) that return a
-  joint-side Command. MoteusSession sends them at a fixed rate, checks safety
-  limits on every sample, logs everything, and always stops the motor,
-  restores the moteus configuration, and saves the data on exit.
-* Every experiment runs against the simulator in moteus_sim.py with --sim.
+  joint-side Command. WristSession sends them at a fixed rate; every loop
+  cycle (2 ms) is logged from the library's own log, tagged with the command
+  it used. Safety limits are checked on every sample; on exit the wrist is
+  always braked or disabled and the data saved.
+* Every experiment runs against the simulated wrist in p4_sim.py with --sim:
+  the same library, against emulated pucks and a plant.
 """
 import argparse
 import asyncio
@@ -32,41 +39,15 @@ from typing import Callable, Optional
 
 import device_config
 
-
-MOTEUS_OUTPUT_RATIO_NOTE = (
-    "This project assumes moteus motor_position.rotor_to_output_ratio = 1. "
-    "GEAR_RATIO is the external cable reduction from measured motor revs to "
-    "the characterized joint/load."
-)
-
 DATA_ROOT = Path('data')
 
-# moteus modes and the fault code reported with them.
+# Logged 'mode' column, numbered as moteus modes so old and new logs read alike.
 MODE_STOPPED = 0
 MODE_FAULT = 1
 MODE_POSITION = 10
 MODE_TIMEOUT = 11
-
-# Read (best effort) at startup and stored with every run.
-CONFIG_SNAPSHOT_KEYS = [
-    'servo.pid_position.kp',
-    'servo.pid_position.ki',
-    'servo.pid_position.kd',
-    'servo.pid_position.ilimit',
-    'servo.max_current_A',
-    'servo.max_velocity',
-    'servo.max_voltage',
-    'servo.default_velocity_limit',
-    'servo.default_accel_limit',
-    'servo.default_timeout_s',
-    'servo.timeout_max_torque',
-    'servo.max_position_slip',
-    'servopos.position_min',
-    'servopos.position_max',
-    'servo.pwm_rate_hz',
-    'motor_position.rotor_to_output_ratio',
-    'motor.Kv',
-]
+MODE_STAY_WITHIN = 13
+MODE_BRAKE = 15
 
 
 # --- unit conversions ------------------------------------------------------------
@@ -78,38 +59,7 @@ def motor_revs_to_joint_degrees(motor_revs, gear_ratio):
     return (motor_revs / gear_ratio) * 360.0
 
 
-def motor_revs_to_joint_radians(motor_revs, gear_ratio):
-    return (motor_revs / gear_ratio) * (2.0 * math.pi)
-
-
-def joint_radians_to_motor_revs(joint_rad, gear_ratio):
-    return (joint_rad / (2.0 * math.pi)) * gear_ratio
-
-
-def motor_velocity_to_joint_deg_s(motor_rev_s, gear_ratio):
-    return motor_revs_to_joint_degrees(motor_rev_s, gear_ratio)
-
-
-def motor_torque_to_joint_torque(motor_torque_nm, gear_ratio):
-    return motor_torque_nm * gear_ratio
-
-
-def joint_torque_to_motor_torque(joint_torque_nm, gear_ratio):
-    return joint_torque_nm / gear_ratio
-
-
-def joint_gains_to_moteus(kp_joint_nm_rad, kd_joint_nms_rad, gear_ratio):
-    """Convert load-side joint gains to moteus gains in motor-rev units.
-
-    With moteus configured at rotor_to_output_ratio=1, position is measured in
-    motor revolutions and torque is motor-side Nm. A cable reduction of N means
-    joint angle = motor angle / N and joint torque ~= motor torque * N, so both
-    Kp and Kd scale by 2*pi/N^2.
-    """
-    scale = (2.0 * math.pi) / (gear_ratio ** 2)
-    return kp_joint_nm_rad * scale, kd_joint_nms_rad * scale
-
-
+# --- motion profiles ----------------------------------------------------------------
 def min_jerk(s):
     """Minimum-jerk profile: position fraction and d/ds for s in [0, 1]."""
     s = min(max(s, 0.0), 1.0)
@@ -128,16 +78,16 @@ def min_jerk_duration(distance_deg, peak_speed_deg_s):
 @dataclass
 class Command:
     """Joint-side command. position_deg is relative to the start pose."""
-    position_deg: float = math.nan   # nan holds the current setpoint (moteus semantics)
+    position_deg: float = math.nan   # nan holds the current setpoint, integrating velocity
     velocity_deg_s: float = 0.0      # Velocity feedforward (setpoint integrates it)
     torque_nm: float = 0.0           # Feedforward torque
     kp_scale: float = 1.0
     kd_scale: float = 1.0
     max_torque_nm: Optional[float] = None   # Per-command cap; device cap if None
-    # moteus stay-within mode: (lower_deg, upper_deg), nan for an open side.
-    # Inside the bounds only torque_nm is applied; outside, the position gains
-    # (x kp/kd_scale) push back toward the violated bound: a unilateral wall
-    # rendered at the firmware rate. position_deg/velocity_deg_s are ignored.
+    # Stay-within: (lower_deg, upper_deg), nan for an open side. Inside the
+    # bounds only torque_nm is applied; outside, the gains (x kp/kd_scale) push
+    # back toward the violated bound: a unilateral wall rendered by the 500 Hz
+    # loop. position_deg/velocity_deg_s are ignored.
     stay_within: Optional[tuple] = None
 
 
@@ -158,8 +108,11 @@ RESERVED_COLUMNS = frozenset({
     'cmd_ff_torque_nm', 'kp_scale', 'kd_scale', 'kp_joint_nm_rad', 'kd_joint_nms_rad',
     'max_torque_nm', 'motor_pos_rev', 'joint_pos_deg', 'joint_vel_deg_s', 'joint_torque_nm',
     'q_current_a', 'control_joint_deg', 'control_joint_vel_deg_s', 'control_joint_torque_nm',
-    'voltage_v', 'board_temp_c', 'motor_temp_c', 'mode', 'fault', 'output_enc_rev',
-    'output_joint_raw_deg', 'ext_torque_nm', 'stay_lower_deg', 'stay_upper_deg',
+    'voltage_v', 'board_temp_c', 'motor_temp_c', 'mode', 'fault', 'ext_torque_nm',
+    'stay_lower_deg', 'stay_upper_deg', 'loop_cycle', 'wrist_state', 'late_ms', 'missed_feedback',
+    'q_ps_deg', 'q_fe_deg', 'q_ur_deg', 'tau_cmd_ps_nm', 'tau_cmd_fe_nm', 'tau_cmd_ur_nm',
+    'tau_meas_ps_nm', 'tau_meas_fe_nm', 'tau_meas_ur_nm', 'counts_6', 'counts_7', 'counts_8',
+    'permille_6', 'permille_7', 'permille_8', 'current_6_a', 'current_7_a', 'current_8_a',
 })
 
 
@@ -224,11 +177,12 @@ def describe_plan(segments, max_torque_nm=None, points_per_segment=50):
 
 # --- safety ------------------------------------------------------------------------
 class SafetyAbort(RuntimeError):
-    """Raised when a safety limit trips; the session brakes and stops the motor."""
+    """Raised when a safety limit trips; the session brakes and disables the wrist."""
 
 
 @dataclass
 class SafetyLimits:
+    """Host-side checks on every logged sample (the p4wrist loop has its own)."""
     joint_min_deg: float = device_config.JOINT_LIMITS_DEG[0]
     joint_max_deg: float = device_config.JOINT_LIMITS_DEG[1]
     max_joint_velocity_deg_s: float = device_config.MAX_JOINT_VELOCITY_DEG_S
@@ -238,9 +192,9 @@ class SafetyLimits:
     def check(self, row):
         mode = row.get('mode')
         if mode == MODE_FAULT:
-            return f"moteus fault (code {row.get('fault')})"
+            return f"p4wrist fault: {row.get('fault_text') or row.get('fault')}"
         if mode == MODE_TIMEOUT:
-            return 'moteus watchdog timeout (host stopped commanding in time)'
+            return 'p4wrist watchdog timeout (host stopped commanding in time)'
         pos = row.get('joint_pos_deg', math.nan)
         if math.isfinite(pos) and not (self.joint_min_deg <= pos <= self.joint_max_deg):
             return (f'joint position {pos:.1f} deg outside '
@@ -258,14 +212,14 @@ class SafetyLimits:
 
 
 # --- clocks --------------------------------------------------------------------------
-class HardwareClock:
-    """Monotonic clock with sub-millisecond waits (sleep, then yield-spin)."""
+class WristClock:
+    """The p4wrist loop clock, with sub-millisecond waits (sleep, then yield-spin)."""
 
-    def __init__(self):
-        self._t0 = time.monotonic()
+    def __init__(self, wrist):
+        self.wrist = wrist
 
     def now(self):
-        return time.monotonic() - self._t0
+        return self.wrist.now()
 
     async def sleep_until(self, t):
         while True:
@@ -281,12 +235,28 @@ class HardwareClock:
         await self.sleep_until(self.now() + dt)
 
 
+class SimClock:
+    """Simulated time: waiting steps the p4wrist loop (and so the plant)."""
+
+    def __init__(self, wrist):
+        self.wrist = wrist
+
+    def now(self):
+        return self.wrist.now()
+
+    async def sleep_until(self, t):
+        self.wrist.wait_until(t)
+
+    async def sleep(self, dt):
+        await self.sleep_until(self.now() + dt)
+
+
 # --- external torque sensors ---------------------------------------------------------
 class ExternalSensor:
     kind = 'none'
     continuous = False      # True if every sample carries ext_torque_nm
 
-    def sample(self, registers):
+    def sample(self):
         return math.nan
 
     def close(self):
@@ -314,24 +284,6 @@ class ManualSensor(ExternalSensor):
 
     def describe(self):
         return {'type': self.kind, 'lever_arm_m': self.lever_arm_m}
-
-
-class MoteusAnalogSensor(ExternalSensor):
-    """Load-cell amplifier read through a moteus aux analog input register."""
-    kind = 'moteus_analog'
-    continuous = True
-
-    def __init__(self, config):
-        import moteus
-        self.config = config
-        self.register = int(getattr(moteus.Register, config['register']))
-
-    def sample(self, registers):
-        raw = registers.get(self.register, math.nan)
-        return (raw - self.config.get('offset_units', 0.0)) * self.config['nm_per_unit']
-
-    def describe(self):
-        return dict(self.config)
 
 
 class AtiNetFTSensor(ExternalSensor):
@@ -369,7 +321,7 @@ class AtiNetFTSensor(ExternalSensor):
                 values = struct.unpack('!3I6i', packet)
                 self.latest = values[3 + self.axis] * self.scale
 
-    def sample(self, registers):
+    def sample(self):
         return self.latest
 
     def close(self):
@@ -384,7 +336,8 @@ class AtiNetFTSensor(ExternalSensor):
 
 
 class SimSensor(ExternalSensor):
-    """Simulated sensor: reads the plant's true output torque plus noise."""
+    """Simulated sensor: the plant's true handle (or lock) torque plus noise,
+    sampled once per loop cycle."""
     continuous = True
 
     def __init__(self, config, plant):
@@ -393,7 +346,7 @@ class SimSensor(ExternalSensor):
         self.plant = plant
         self.lever_arm_m = self.config.get('lever_arm_m') if self.kind == 'manual' else None
 
-    def sample(self, registers):
+    def sample(self):
         return self.plant.external_torque()
 
     def describe(self):
@@ -408,97 +361,9 @@ def make_sensor(config, plant=None):
     kind = config.get('type')
     if kind == 'manual':
         return ManualSensor(config)
-    if kind == 'moteus_analog':
-        return MoteusAnalogSensor(config)
     if kind == 'ati_netft':
         return AtiNetFTSensor(config)
     raise ValueError(f'Unknown EXTERNAL_TORQUE_SENSOR type {kind!r}')
-
-
-# --- moteus helpers ------------------------------------------------------------------
-def make_query_resolution(output_encoder=None, analog_register=None):
-    """Query position/velocity/torque/current/temperatures plus control state."""
-    import moteus
-    mp = moteus.multiplex
-    qr = moteus.QueryResolution()
-    qr.mode = mp.INT8
-    qr.position = mp.F32
-    qr.velocity = mp.F32
-    qr.torque = mp.F32
-    qr.q_current = mp.F32
-    qr.motor_temperature = mp.F32
-    qr.voltage = mp.INT8
-    qr.temperature = mp.INT8
-    qr.fault = mp.INT8
-    extra = {
-        moteus.Register.CONTROL_POSITION: mp.F32,
-        moteus.Register.CONTROL_VELOCITY: mp.F32,
-        moteus.Register.CONTROL_TORQUE: mp.F32,
-    }
-    if output_encoder:
-        extra[getattr(moteus.Register, output_encoder['register'])] = mp.F32
-    if analog_register:
-        extra[getattr(moteus.Register, analog_register)] = mp.F32
-    qr._extra = extra   # Instance attribute; the class default dict is shared.
-    return qr
-
-
-def state_value(state, register, default=math.nan):
-    if register is None:
-        return default
-    try:
-        return state.values[register]
-    except (AttributeError, KeyError):
-        return default
-
-
-def state_register_value(state, register_group, name, default=math.nan):
-    return state_value(state, getattr(register_group, name, None), default)
-
-
-def _register_ids():
-    try:
-        import moteus
-        R = moteus.Register
-        return {name: int(getattr(R, name)) for name in [
-            'MODE', 'POSITION', 'VELOCITY', 'TORQUE', 'Q_CURRENT', 'VOLTAGE',
-            'TEMPERATURE', 'MOTOR_TEMPERATURE', 'FAULT', 'CONTROL_POSITION',
-            'CONTROL_VELOCITY', 'CONTROL_TORQUE']}
-    except ImportError:
-        return {}
-
-
-def _format_conf_value(value):
-    if isinstance(value, str):
-        return value
-    if value is None or (isinstance(value, float) and math.isnan(value)):
-        return 'nan'
-    return f'{value:.9g}'
-
-
-async def configure_position_pid(controller, kp_nm_per_rev, kd_nm_per_rev_s, ki=0.0,
-                                 persist=False):
-    """Set servo.pid_position gains (kept for scripts that use the old API)."""
-    import moteus
-    stream = moteus.Stream(controller, verbose=False)
-    for name, value in {'kp': kp_nm_per_rev, 'kd': kd_nm_per_rev_s, 'ki': ki}.items():
-        await stream.command(f'conf set servo.pid_position.{name} {value:.9g}'.encode('latin1'))
-    if persist:
-        await stream.command(b'conf write')
-    verified = {}
-    for name in ('kp', 'kd', 'ki'):
-        response = await stream.command(
-            f'conf get servo.pid_position.{name}'.encode('latin1'), allow_any_response=True)
-        verified[name] = _decode(response)
-    return verified
-
-
-def _decode(response):
-    if response is None:
-        return ''
-    if isinstance(response, bytes):
-        return response.decode('latin1', errors='replace').strip()
-    return str(response).strip()
 
 
 # --- files and provenance ------------------------------------------------------------
@@ -580,18 +445,14 @@ def device_config_snapshot():
 def make_arg_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--sim', action='store_true',
-                        help='run against the simulated wrist in moteus_sim.py')
+                        help='run against the simulated wrist in p4_sim.py')
     parser.add_argument('--seed', type=int, default=0, help='simulator random seed')
     parser.add_argument('--out', help='output directory (default data/<experiment>/<timestamp>)')
     parser.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
     parser.add_argument('--quick', action='store_true',
                         help='shortened protocol for dry runs and tests')
-    parser.add_argument('--controller-id', type=int, default=device_config.CONTROLLER_ID)
-    try:
-        import moteus
-        moteus.make_transport_args(parser)
-    except ImportError:
-        pass
+    parser.add_argument('--interface', default=device_config.CAN_INTERFACE,
+                        help='SocketCAN interface of the wrist pucks')
     return parser
 
 
@@ -613,27 +474,124 @@ def run_cli(coro_factory):
         print(f'\nABORTED by safety check: {exc}', file=sys.stderr)
         raise SystemExit(1)
     except KeyboardInterrupt:
-        print('\nABORTED by user; motor stopped and partial data saved.', file=sys.stderr)
+        print('\nABORTED by user; wrist braked and disabled, partial data saved.', file=sys.stderr)
         raise SystemExit(130)
 
 
+# --- p4wrist setup --------------------------------------------------------------------
+JOINT_NAMES = device_config.JOINT_NAMES
+
+
+def wrist_config(p4wrist, simulated):
+    """p4wrist loop configuration from device_config."""
+    c = p4wrist.default_config()
+    c.node = p4wrist.I3(*device_config.NODES)
+    for i in range(3):
+        for j in range(3):
+            c.j2mp[i][j] = device_config.J2MP[i][j]
+    c.position_sign = p4wrist.D3(*device_config.POSITION_SIGN)
+    c.torque_sign = p4wrist.D3(*device_config.TORQUE_SIGN)
+    c.period_s = device_config.LOOP_PERIOD_S
+    for j, name in enumerate(JOINT_NAMES):
+        lo, hi = device_config.JOINT_RANGE_DEG[name]
+        c.joint_min[j] = math.radians(lo)
+        c.joint_max[j] = math.radians(hi)
+        c.max_joint_velocity[j] = math.radians(device_config.MAX_JOINT_VELOCITY_DEG_S)
+        c.max_joint_torque[j] = device_config.MAX_JOINT_TORQUE_NM
+    c.velocity_filter_hz = device_config.VELOCITY_FILTER_HZ
+    c.command_timeout_s = device_config.WATCHDOG_TIMEOUT_S
+    c.brake_s = device_config.FAULT_BRAKE_S
+    c.current_torque_factor = device_config.CURRENT_TORQUE_FACTOR
+    c.max_motor_permille = device_config.MAX_MOTOR_PERMILLE
+    c.sync_loss_timeout_ms = device_config.SYNC_LOSS_TIMEOUT_MS
+    c.realtime_priority = 0 if simulated else device_config.REALTIME_PRIORITY
+    return c
+
+
+def load_zero_calibration():
+    """wrist_calibration.json (from zero_calibration.py), or None."""
+    path = Path(device_config.ZERO_CALIBRATION_FILE)
+    if not path.exists():
+        return None
+    cal = json.loads(path.read_text())
+    if any(abs(a - b) > 1e-9 for a, b in zip(cal['home_deg'], device_config.HOME_DEG)):
+        raise SystemExit(f'{path} was recorded for home {cal["home_deg"]} deg but HOME_DEG is '
+                         f'{device_config.HOME_DEG}; rerun zero_calibration.py.')
+    return cal
+
+
+def load_zero_record(p4wrist):
+    path = Path(device_config.ZERO_RECORD_FILE)
+    if not path.exists():
+        return None
+    try:
+        return p4wrist.record_from_dict(json.loads(path.read_text()))
+    except (ValueError, KeyError):
+        return None
+
+
+def save_zero_record(p4wrist, record):
+    path = Path(device_config.ZERO_RECORD_FILE)
+    if record.valid:
+        write_json(path, p4wrist.record_to_dict(record))
+    elif path.exists():
+        path.unlink()
+
+
+def placement_warnings(from_home_rad):
+    """Rough placement is right only within half a motor turn of home."""
+    lines = []
+    m = [sum(device_config.J2MP[i][j] * from_home_rad[j] for j in range(3)) for i in range(3)]
+    for i, node in enumerate(device_config.NODES):
+        fraction = abs(m[i]) / math.pi
+        if fraction > 0.6:
+            lines.append(f'WARNING: motor {node} was {100 * fraction:.0f}% of the way to the '
+                         'half-turn limit of rough placement; if the zero looks wrong, place the '
+                         'wrist closer to home and restart.')
+    return lines
+
+
 # --- the session ---------------------------------------------------------------------
-class MoteusSession:
-    """One experiment run: connection, configuration, safety, timing, logging.
+@dataclass
+class _SegmentMeta:
+    index: int
+    phase: str
+    info: dict
+    t0: float
+    log: bool
+
+
+@dataclass
+class _Sent:
+    meta: _SegmentMeta
+    command: Command
+    t_send: float
+    cap: float
+    kp: float
+    kd: float
+
+
+class WristSession:
+    """One experiment run: connection, zeroing, safety, timing, logging.
 
     Usage:
-        async with MoteusSession('step_response', args, kp, kd, config=cfg) as s:
+        async with WristSession('step_response', args, kp, kd, config=cfg) as s:
             await s.run(segments)
     """
 
     def __init__(self, experiment, args, kp_joint_nm_rad, kd_joint_nms_rad, *,
-                 config=None, rate_hz=1000.0, needs_sensor=False, sim_params=None,
+                 config=None, rate_hz=500.0, needs_sensor=False, sim_params=None,
                  limits: Optional[SafetyLimits] = None, max_torque_nm=None):
         self.experiment = experiment
         self.args = args
         self.config = config
-        self.rate_hz = rate_hz
+        self.j = device_config.JOINT_INDEX
+        self.joint = device_config.JOINT
         self.N = device_config.GEAR_RATIO
+        self.loop_rate_hz = 1.0 / device_config.LOOP_PERIOD_S
+        # Commands faster than the loop are never seen by it.
+        self.rate_hz = min(rate_hz, self.loop_rate_hz)
+        self.requested_rate_hz = rate_hz
         self.kp_joint = kp_joint_nm_rad
         self.kd_joint = kd_joint_nms_rad
         self.max_torque_nm = min(max_torque_nm or device_config.MAX_JOINT_TORQUE_NM,
@@ -648,76 +606,120 @@ class MoteusSession:
         self.segment_index = -1
         self.last_sample = None
         self.last_command = Command()
-        self.start_rev = math.nan
-        self.original_config = {}
-        self.config_snapshot = {}
-        self.changed_keys = []
+        self.start_q = [0.0, 0.0, 0.0]
         self.abort_reason = None
         self.completed = False
         self.run_dir = None
         self.plant = None
+        self.bus = None
+        self.wrist = None
         self.sensor = ExternalSensor()
-        self._reg = _register_ids()
-        self._output_encoder = device_config.OUTPUT_ENCODER
-        self._encoder_reg = None
         self._t_started = None
+        self._seq = 0
+        self._sent = {}
+        self._ext_by_cycle = []
+        self._fault_text = ''
+        self._p4 = None
+        # Primary motor of the joint under test (reports its current and
+        # temperatures) and the sign that makes its current follow joint torque.
+        col = [device_config.J2MP[i][self.j] for i in range(3)]
+        self._primary = max(range(3), key=lambda i: abs(col[i]))
+        inv_t = _inverse_transpose(device_config.J2MP)
+        self._current_sign = math.copysign(1.0, inv_t[self._primary][self.j])
 
     # --- lifecycle ---------------------------------------------------------------------
     async def __aenter__(self):
+        from wrist_backend import p4wrist
+        self._p4 = p4wrist
         self.run_dir = new_run_dir(self.experiment, self.is_sim, getattr(self.args, 'out', None))
         sensor_config = device_config.EXTERNAL_TORQUE_SENSOR if self.needs_sensor else None
-        analog_register = (sensor_config.get('register')
-                           if sensor_config and sensor_config.get('type') == 'moteus_analog'
-                           else None)
+        config = wrist_config(p4wrist, self.is_sim)
         if self.is_sim:
-            import moteus_sim
-            params = self.sim_params or moteus_sim.SimParams()
+            import p4_sim
+            params = self.sim_params or p4_sim.SimParams()
             params.seed = getattr(self.args, 'seed', params.seed)
-            params.gear_ratio = self.N
-            analog = sensor_config if analog_register else None
-            self.controller, self.clock, stream_factory, self.plant = moteus_sim.make_sim(
-                params, output_encoder=self._output_encoder, analog_sensor=analog)
-            self.stream = stream_factory(self.controller)
+            params.j2mp = device_config.J2MP
+            params.initial_q = tuple(math.radians(x) for x in device_config.HOME_DEG)
+            self.bus, self.plant = p4_sim.make_sim(params, nodes=device_config.NODES)
+            self.plant.test_joint = self.j
+            self.wrist = p4wrist.Wrist.callback(self.bus, config)
+            self.clock = SimClock(self.wrist)
             if self.needs_sensor:
                 self.sensor = make_sensor(sensor_config, plant=self.plant)
+                self.bus.sync_hooks.append(lambda: self._ext_by_cycle.append(self.sensor.sample()))
         else:
-            import moteus
-            qr = make_query_resolution(self._output_encoder, analog_register)
-            transport = moteus.get_singleton_transport(self.args)
-            self.controller = moteus.Controller(
-                id=self.args.controller_id, query_resolution=qr, transport=transport)
-            self.clock = HardwareClock()
-            self.stream = moteus.Stream(self.controller, verbose=False)
+            self.wrist = p4wrist.Wrist.socketcan(getattr(self.args, 'interface', None)
+                                                 or device_config.CAN_INTERFACE, config)
+            self.clock = WristClock(self.wrist)
             if self.needs_sensor:
                 self.sensor = make_sensor(sensor_config)
-        if self._output_encoder:
-            import moteus
-            self._encoder_reg = int(getattr(moteus.Register, self._output_encoder['register']))
-
+        self.metadata['p4wrist_config'] = config.to_dict()
         try:
-            await self.controller.set_stop()
-            await self._stop_telemetry()
-            await self._snapshot_config()
-            self._check_units()
-            await self._apply_config()
-
-            state = await self.controller.query()
-            self.start_rev = state_value(state, self._reg['POSITION'])
-            if not math.isfinite(self.start_rev):
-                raise RuntimeError('Could not read the motor position from moteus.')
-            mode = state_value(state, self._reg['MODE'])
-            if mode == MODE_FAULT:
-                raise RuntimeError(f"moteus is in fault {state_value(state, self._reg['FAULT'])}; "
-                                   'clear it before running.')
+            self._connect_and_zero()
+            self.wrist.start()
+            await self.clock.sleep(0.05)   # positions, statuswords, SYNC-loss timer armed
+            s = self.wrist.sample()
+            if s.fault:
+                self.log_event('fault_before_enable', fault=int(s.fault), text=self.wrist.fault_text())
+                self.wrist.clear_fault()
+            self.wrist.enable(3.0)
+            self.start_q = list(self.wrist.sample().q)
+            if self.is_sim:
+                self.plant.human_origin = self.start_q[self.j]
+            # Feed the watchdog at once: hold every joint where it is.
+            self._send(Command(position_deg=0.0, kp_scale=0.0, kd_scale=0.0),
+                       _SegmentMeta(-1, 'start', {}, self.clock.now(), False))
+            self.metadata['drive_info'] = self.wrist.drive_info()
+            self._limit_torque_to_drives()
         except BaseException:
-            try:
-                await self.controller.set_stop()
-                await self._restore_config()
-            finally:
-                self.sensor.close()
+            self._shutdown()
             raise
         self._t_started = datetime.now(timezone.utc).isoformat()
         return self
+
+    def _limit_torque_to_drives(self):
+        """Cap commands at what the motors can deliver to this joint: a pure
+        joint torque needs j2mp^-T times it from every motor it couples to."""
+        inv_t = _inverse_transpose(device_config.J2MP)
+        limit = math.inf
+        for i, drive in enumerate(self.metadata['drive_info']):
+            share = abs(inv_t[i][self.j])
+            if share > 0:
+                motor_cap = device_config.MAX_MOTOR_PERMILLE * drive['rated_torque_mnm'] / 1e6
+                limit = min(limit, motor_cap / share)
+        self.metadata['motor_limited_torque_nm'] = limit
+        if limit < self.max_torque_nm:
+            self.log_event('torque_cap_lowered', from_nm=self.max_torque_nm, to_nm=limit)
+            self.max_torque_nm = limit
+
+    def _connect_and_zero(self):
+        p4wrist = self._p4
+        record = None if self.is_sim else load_zero_record(p4wrist)
+        kept, report = self.wrist.connect(record)
+        home = [math.radians(x) for x in device_config.HOME_DEG]
+        zero = {'kept_previous_zero': kept, 'report': report}
+        if not self.is_sim:
+            print(report)
+        if not kept:
+            cal = None if self.is_sim else load_zero_calibration()
+            if cal and cal.get('single_turn_dir') and all(cal['single_turn_dir']):
+                cal_struct = p4wrist.zero_cal(home, cal['single_turn_at_home'], cal['single_turn_dir'])
+                from_home = self.wrist.zero(cal_struct, exact=False)
+                zero['method'] = 'single-turn encoders (rough placement)'
+                print('Zeroed from the single-turn encoders; the wrist sat this far from home (deg): '
+                      + ', '.join(f'{n} {math.degrees(d):+.2f}' for n, d in zip(JOINT_NAMES, from_home)))
+                for line in placement_warnings(from_home):
+                    print(line)
+            else:
+                if not self.is_sim:
+                    confirm(self.args, ['', 'ZERO: place the wrist exactly at the home pose '
+                                        f'{device_config.HOME_DEG} deg (PS, FE, UR).'])
+                from_home = self.wrist.zero(p4wrist.zero_cal(home), exact=True)
+                zero['method'] = 'placed at home'
+            zero['from_home_deg'] = [math.degrees(d) for d in from_home]
+            if not self.is_sim:
+                save_zero_record(p4wrist, self.wrist.zero_record())
+        self.metadata['zero'] = zero
 
     async def __aexit__(self, exc_type, exc, tb):
         if exc is None:
@@ -726,210 +728,222 @@ class MoteusSession:
             self.abort_reason = f'{exc_type.__name__}: {exc}' if str(exc) else exc_type.__name__
         try:
             if exc is not None:
-                # Brake first so a moving joint is damped, then leave it stopped.
+                # Brake first so a moving joint is damped, then disable.
                 try:
-                    await self.controller.set_brake()
-                    await self.clock.sleep(0.3)
+                    await self.brake(0.3, phase='abort_brake')
                 except Exception:
                     pass
-            await self.controller.set_stop()
-            await self._restore_config()
+            self.wrist.disable(1.0)
         except BaseException as cleanup_error:   # Keep going: data must still be saved.
             print(f'WARNING: cleanup error: {cleanup_error!r}', file=sys.stderr)
         finally:
-            self.sensor.close()
+            self._shutdown()
             self.save()
         return False
 
-    # --- moteus configuration --------------------------------------------------------
-    async def _stop_telemetry(self):
+    def _shutdown(self):
         try:
-            await self.stream.write_message(b'tel stop')
-            await self.stream.flush_read()
-        except Exception as exc:
-            print(f'WARNING: could not stop telemetry: {exc!r}', file=sys.stderr)
-
-    async def conf_get(self, key, timeout=1.0):
-        try:
-            response = await asyncio.wait_for(
-                self.stream.command(f'conf get {key}'.encode('latin1'), allow_any_response=True),
-                timeout)
-        except Exception:
-            await self._recover_stream()
-            return None
-        text = _decode(response)
-        return None if text.startswith('ERR') or text == '' else text
-
-    async def conf_set(self, key, value, remember=True, timeout=1.0):
-        if remember and key not in self.original_config:
-            original = self.config_snapshot.get(key)
-            if original is None:
-                original = await self.conf_get(key)
-            self.original_config[key] = original
-        text = _format_conf_value(value)
-        await asyncio.wait_for(
-            self.stream.command(f'conf set {key} {text}'.encode('latin1')), timeout)
-        if key not in self.changed_keys:
-            self.changed_keys.append(key)
-
-    async def _recover_stream(self):
-        try:
-            await self.stream.flush_read()
-        except Exception:
-            pass
-
-    async def _snapshot_config(self):
-        for key in CONFIG_SNAPSHOT_KEYS:
-            value = await self.conf_get(key)
-            if value is not None:
-                self.config_snapshot[key] = value
-
-    def _check_units(self):
-        ratio = self.config_snapshot.get('motor_position.rotor_to_output_ratio')
-        if ratio is not None and abs(float(ratio) - 1.0) > 1e-6:
-            raise RuntimeError(
-                f'motor_position.rotor_to_output_ratio is {ratio}, but these scripts assume 1 '
-                '(positions in motor revs, GEAR_RATIO applied on the host).')
-
-    async def _apply_config(self):
-        """Gains for this run, no trajectory limiting, no integrator."""
-        await self.set_gains(self.kp_joint, self.kd_joint)
-        await self.conf_set('servo.pid_position.ki', 0.0)
-        # A non-nan default velocity/accel limit makes moteus turn steps into
-        # trajectories, which would invalidate step and frequency responses.
-        # A finite max_position_slip drags the setpoint toward the measured
-        # position, which shrinks large steps and distorts tracking tests.
-        for key in ('servo.default_velocity_limit', 'servo.default_accel_limit',
-                    'servo.max_position_slip'):
-            if key not in self.config_snapshot:
-                print(f'NOTE: {key} not reported by this firmware; assuming it is disabled.')
-                continue
-            await self.conf_set(key, math.nan)
-            value = await self.conf_get(key)
-            if value is not None and value.lower() != 'nan':
-                raise RuntimeError(f'{key} reads back {value}; expected nan.')
-        verified = {}
-        for name in ('kp', 'kd', 'ki'):
-            verified[name] = await self.conf_get(f'servo.pid_position.{name}')
-        self.metadata['verified_moteus_pid_config'] = verified
-
-    async def set_gains(self, kp_joint_nm_rad, kd_joint_nms_rad):
-        """Set the moteus position-loop gains from joint-side values."""
-        kp_m, kd_m = joint_gains_to_moteus(kp_joint_nm_rad, kd_joint_nms_rad, self.N)
-        await self.conf_set('servo.pid_position.kp', kp_m)
-        await self.conf_set('servo.pid_position.kd', kd_m)
-        self.kp_joint = kp_joint_nm_rad
-        self.kd_joint = kd_joint_nms_rad
-        self.events.append({'time': self.clock.now(), 'event': 'set_gains',
-                            'kp_joint_nm_rad': kp_joint_nm_rad,
-                            'kd_joint_nms_rad': kd_joint_nms_rad})
-
-    async def _restore_config(self):
-        for key in reversed(self.changed_keys):
-            original = self.original_config.get(key)
-            if original is None:
-                continue
-            try:
-                await self.conf_set(key, original, remember=False)
-            except Exception as exc:
-                print(f'WARNING: could not restore {key}={original}: {exc!r}', file=sys.stderr)
+            if self.wrist is not None:
+                try:
+                    self._drain()
+                except Exception:
+                    pass
+                self.wrist.stop()
+                if not self.is_sim:
+                    save_zero_record(self._p4, self.wrist.zero_record())
+                self.wrist.close()
+        except BaseException as error:
+            print(f'WARNING: shutdown error: {error!r}', file=sys.stderr)
+        finally:
+            self.sensor.close()
 
     # --- commanding --------------------------------------------------------------------
-    async def command(self, cmd: Command):
-        """Send one command, read the reply, check safety, and return the row."""
-        N = self.N
-        if math.isfinite(cmd.position_deg):
-            position = self.start_rev + joint_degrees_to_motor_revs(cmd.position_deg, N)
-        else:
-            position = math.nan
+    def _send(self, cmd: Command, meta: _SegmentMeta, brake=False):
+        p4wrist = self._p4
+        self._seq += 1
+        t = self.clock.now()
         cap = self.max_torque_nm if cmd.max_torque_nm is None else min(
             abs(cmd.max_torque_nm), self.max_torque_nm)
-        t_send = self.clock.now()
+        kp = self.kp_joint * cmd.kp_scale
+        kd = self.kd_joint * cmd.kd_scale
+        out = p4wrist.Command()
+        out.seq = self._seq
+        out.t_host = t
+        out.brake = 1 if brake else 0
+        for j, name in enumerate(JOINT_NAMES):
+            if j == self.j:
+                continue
+            out.joint[j] = p4wrist.joint_command(
+                position=self.start_q[j], kp=device_config.HOLD_KP_NM_RAD[name],
+                kd=device_config.HOLD_KD_NMS_RAD[name], max_torque=device_config.HOLD_MAX_TORQUE_NM)
+        q0 = self.start_q[self.j]
         if cmd.stay_within is not None:
             def bound(deg):
-                if deg is None or not math.isfinite(deg):
-                    return math.nan
-                return self.start_rev + joint_degrees_to_motor_revs(deg, N)
-
-            state = await self.controller.set_stay_within(
-                lower_bound=bound(cmd.stay_within[0]),
-                upper_bound=bound(cmd.stay_within[1]),
-                feedforward_torque=cmd.torque_nm / N,
-                kp_scale=cmd.kp_scale,
-                kd_scale=cmd.kd_scale,
-                maximum_torque=cap / N,
-                watchdog_timeout=device_config.WATCHDOG_TIMEOUT_S,
-                query=True,
-            )
+                return q0 + math.radians(deg) if deg is not None and math.isfinite(deg) else math.nan
+            out.joint[self.j] = p4wrist.joint_command(
+                torque=cmd.torque_nm, kp=kp, kd=kd, max_torque=cap, lower=bound(cmd.stay_within[0]),
+                upper=bound(cmd.stay_within[1]), mode=p4wrist.MODE_STAY_WITHIN)
         else:
-            state = await self.controller.set_position(
-                position=position,
-                velocity=joint_degrees_to_motor_revs(cmd.velocity_deg_s, N),
-                feedforward_torque=cmd.torque_nm / N,
-                kp_scale=cmd.kp_scale,
-                kd_scale=cmd.kd_scale,
-                maximum_torque=cap / N,
-                watchdog_timeout=device_config.WATCHDOG_TIMEOUT_S,
-                query=True,
-            )
-        t_reply = self.clock.now()
-        row = self._parse(state)
-        if cmd.stay_within is not None:
-            row['stay_lower_deg'] = cmd.stay_within[0]
-            row['stay_upper_deg'] = cmd.stay_within[1]
-        row.update({
-            'time': t_reply,
-            't_send': t_send,
+            position = q0 + math.radians(cmd.position_deg) if math.isfinite(cmd.position_deg) else math.nan
+            out.joint[self.j] = p4wrist.joint_command(
+                position=position, velocity=math.radians(cmd.velocity_deg_s), torque=cmd.torque_nm,
+                kp=kp, kd=kd, max_torque=cap)
+        self.wrist.set_command(out)
+        self._sent[self._seq] = _Sent(meta, cmd, t, cap, kp, kd)
+        self.last_command = cmd
+
+    def _drain(self):
+        """Rows for every loop cycle since the last call, tagged with their commands."""
+        log, dropped = self.wrist.read_log()
+        if dropped:
+            self.log_event('log_overflow', dropped=int(dropped))
+        rows = []
+        if len(log) and int(log['fault'][-1]) and not self._fault_text:
+            self._fault_text = self.wrist.fault_text()
+        ext = self.sensor.sample() if (self.sensor.continuous and not self.is_sim) else math.nan
+        for rec in log:
+            sent = self._sent.get(int(rec['command_seq']))
+            if sent is None:
+                continue   # cycles before this session's first command
+            row = self._row(rec, sent)
+            if self.sensor.continuous:
+                if self.is_sim:
+                    cycle = int(rec['cycle'])
+                    row['ext_torque_nm'] = (self._ext_by_cycle[cycle] if cycle < len(self._ext_by_cycle)
+                                            else math.nan)
+                else:
+                    row['ext_torque_nm'] = ext
+            rows.append(row)
+            if sent.meta.log:
+                self.rows.append(row)
+        if len(log):
+            oldest = int(log['command_seq'][-1])
+            for seq in [s for s in self._sent if s < oldest]:
+                del self._sent[seq]
+        return rows
+
+    def _row(self, rec, sent):
+        j, N, q0 = self.j, self.N, self.start_q
+        p = self._primary
+        q, qd = rec['q'], rec['qd']
+        state, fault = int(rec['wrist_state']), int(rec['fault'])
+        p4 = self._p4
+        if state == p4.STATE_ACTIVE:
+            mode = int(rec['joint_mode'][j])
+        elif state == p4.STATE_BRAKE:
+            mode = MODE_BRAKE
+        elif state in (p4.STATE_BRAKING, p4.STATE_FAULT):
+            mode = MODE_TIMEOUT if fault == 3 else MODE_FAULT
+        else:
+            mode = MODE_STOPPED
+        cmd = sent.command
+        setpoint = float(rec['setpoint'][j])
+        motor_temp = float(rec['motor_temp'][p])
+        if not self.is_sim:
+            thermistor = device_config.MOTOR_THERMISTOR
+            motor_temp = thermistor(motor_temp) if thermistor and math.isfinite(motor_temp) else math.nan
+        t = float(rec['time'])
+        row = {
+            'time': t,
+            't_send': sent.t_send,
+            'loop_cycle': int(rec['cycle']),
+            'segment': sent.meta.index,
+            'phase': sent.meta.phase,
+            't_local': t - sent.meta.t0,
             'cmd_joint_deg': cmd.position_deg,
             'cmd_joint_vel_deg_s': cmd.velocity_deg_s,
             'cmd_ff_torque_nm': cmd.torque_nm,
             'kp_scale': cmd.kp_scale,
             'kd_scale': cmd.kd_scale,
-            'kp_joint_nm_rad': self.kp_joint * cmd.kp_scale,
-            'kd_joint_nms_rad': self.kd_joint * cmd.kd_scale,
-            'max_torque_nm': cap,
-        })
-        self.last_command = cmd
-        reason = self.limits.check(row)
-        if reason:
-            # Keep the offending sample in the log for diagnosis.
-            self.rows.append({**row, 'phase': 'safety_abort', 'segment': self.segment_index})
-            self.abort_reason = reason
-            raise SafetyAbort(reason)
-        return row
-
-    def _parse(self, state):
-        values = getattr(state, 'values', {}) if state is not None else {}
-        R, N = self._reg, self.N
-
-        def get(name):
-            return values.get(R[name], math.nan)
-
-        pos = get('POSITION')
-        control_pos = get('CONTROL_POSITION')
-        row = {
-            'motor_pos_rev': pos,
-            'joint_pos_deg': motor_revs_to_joint_degrees(pos - self.start_rev, N),
-            'joint_vel_deg_s': motor_velocity_to_joint_deg_s(get('VELOCITY'), N),
-            'joint_torque_nm': motor_torque_to_joint_torque(get('TORQUE'), N),
-            'q_current_a': get('Q_CURRENT'),
-            'control_joint_deg': motor_revs_to_joint_degrees(control_pos - self.start_rev, N),
-            'control_joint_vel_deg_s': motor_velocity_to_joint_deg_s(get('CONTROL_VELOCITY'), N),
-            'control_joint_torque_nm': motor_torque_to_joint_torque(get('CONTROL_TORQUE'), N),
-            'voltage_v': get('VOLTAGE'),
-            'board_temp_c': get('TEMPERATURE'),
-            'motor_temp_c': get('MOTOR_TEMPERATURE'),
-            'mode': values.get(R['MODE'], -1),
-            'fault': values.get(R['FAULT'], 0),
+            'kp_joint_nm_rad': sent.kp,
+            'kd_joint_nms_rad': sent.kd,
+            'max_torque_nm': sent.cap,
+            'motor_pos_rev': N * float(q[j]) / (2.0 * math.pi),
+            'joint_pos_deg': math.degrees(float(q[j]) - q0[j]),
+            'joint_vel_deg_s': math.degrees(float(qd[j])),
+            'joint_torque_nm': float(rec['tau_meas'][j]),
+            'q_current_a': self._current_sign * float(rec['current'][p]),
+            'control_joint_deg': math.degrees(setpoint - q0[j]) if math.isfinite(setpoint) else math.nan,
+            'control_joint_vel_deg_s': math.degrees(float(rec['setpoint_velocity'][j])),
+            'control_joint_torque_nm': float(rec['tau_cmd'][j]),
+            'voltage_v': float(rec['bus_voltage'][p]),
+            'board_temp_c': float(rec['amp_temp'][p]),
+            'motor_temp_c': motor_temp,
+            'mode': mode,
+            'fault': fault,
+            'wrist_state': state,
+            'late_ms': 1000.0 * float(rec['late_s']),
+            'missed_feedback': int(rec['missed_feedback']),
         }
-        if self._encoder_reg is not None:
-            enc = values.get(self._encoder_reg, math.nan)
-            scale = self._output_encoder.get('revs_per_joint_rev', 1.0) * self._output_encoder.get('sign', 1)
-            row['output_enc_rev'] = enc
-            row['output_joint_raw_deg'] = enc / scale * 360.0
-        if self.sensor.continuous:
-            row['ext_torque_nm'] = self.sensor.sample(values)
+        for k, name in enumerate(('ps', 'fe', 'ur')):
+            row[f'q_{name}_deg'] = math.degrees(float(q[k]))
+            row[f'tau_cmd_{name}_nm'] = float(rec['tau_cmd'][k])
+            row[f'tau_meas_{name}_nm'] = float(rec['tau_meas'][k])
+        for i, node in enumerate(device_config.NODES):
+            row[f'counts_{node}'] = int(rec['counts'][i])
+            row[f'permille_{node}'] = int(rec['permille'][i])
+            row[f'current_{node}_a'] = float(rec['current'][i])
+        if cmd.stay_within is not None:
+            row['stay_lower_deg'] = cmd.stay_within[0]
+            row['stay_upper_deg'] = cmd.stay_within[1]
+        if fault:
+            row['fault_text'] = self._fault_text
+        row.update(sent.meta.info)
         return row
+
+    def _check(self, rows):
+        for row in rows:
+            reason = self.limits.check(row)
+            if reason:
+                # Keep the offending sample in the log for diagnosis.
+                self.rows.append({**row, 'phase': 'safety_abort'})
+                self.abort_reason = reason
+                raise SafetyAbort(reason)
+
+    async def _loop(self, meta, period, command_for, done, brake=False):
+        """Send command_for(t_local, last) every period until done(t_local, rows) says stop.
+
+        Returns this segment's rows."""
+        rows = []
+        t0 = meta.t0
+        deadline = t0
+        last = self.last_sample
+        while True:
+            t_local = self.clock.now() - t0
+            if done(t_local, None):
+                break
+            self._send(command_for(t_local, last), meta, brake=brake)
+            deadline += period
+            now = self.clock.now()
+            if deadline < now - period:
+                deadline = now   # Fell behind; resynchronize instead of bursting.
+            await self.clock.sleep_until(deadline)
+            new = self._drain()
+            mine = [r for r in new if r['segment'] == meta.index]
+            rows.extend(mine)
+            if new:
+                last = new[-1]
+                self.last_sample = last
+            self._check(new)
+            stop = False
+            for row in mine:
+                if done(row['t_local'], row):
+                    stop = True
+                    break
+            if stop:
+                break
+        return rows
+
+    async def command(self, cmd: Command):
+        """Send one command, wait one loop cycle, and return the latest row."""
+        meta = _SegmentMeta(self.segment_index, 'command', {}, self.clock.now(), True)
+        self._send(cmd, meta)
+        await self.clock.sleep(1.0 / self.loop_rate_hz)
+        new = self._drain()
+        self._check(new)
+        if new:
+            self.last_sample = new[-1]
+        return self.last_sample
 
     async def run(self, segments, log=True):
         """Execute segments in order; returns a SegmentResult per segment."""
@@ -941,90 +955,61 @@ class MoteusSession:
     async def run_segment(self, segment: Segment, log=True):
         check_info(segment.info)
         self.segment_index += 1
-        period = 1.0 / (segment.rate_hz or self.rate_hz)
-        rows = []
-        ended_by = None
-        t0 = self.clock.now()
-        deadline = t0
-        last = self.last_sample
-        while True:
-            t_local = self.clock.now() - t0
+        period = 1.0 / min(segment.rate_hz or self.rate_hz, self.loop_rate_hz)
+        meta = _SegmentMeta(self.segment_index, segment.phase, dict(segment.info),
+                            self.clock.now(), log)
+        ended = {}
+
+        def done(t_local, row):
+            if row is None:
+                return t_local >= segment.duration_s
             if t_local >= segment.duration_s:
-                break
-            row = await self.command(segment.command(t_local, last))
-            row.update({'segment': self.segment_index, 'phase': segment.phase,
-                        't_local': t_local})
-            row.update(segment.info)
-            rows.append(row)
-            if log:
-                self.rows.append(row)
-            last = row
-            self.last_sample = row
+                return True
             if segment.until is not None:
-                ended_by = segment.until(t_local, row)
-                if ended_by:
-                    break
-            deadline += period
-            now = self.clock.now()
-            if deadline < now - period:
-                deadline = now   # Fell behind; resynchronize instead of bursting.
-            await self.clock.sleep_until(deadline)
-        return SegmentResult(self.segment_index, segment.phase, rows, ended_by)
+                reason = segment.until(t_local, row)
+                if reason:
+                    ended['by'] = reason
+                    return True
+            return False
+
+        rows = await self._loop(meta, period, segment.command, done)
+        return SegmentResult(self.segment_index, segment.phase, rows, ended.get('by'))
 
     async def hold_until(self, done: asyncio.Future, command: Command, phase='hold', info=None):
         """Keep commanding (and logging) a hold until `done` completes."""
         check_info(info)
-        period = 1.0 / self.rate_hz
         self.segment_index += 1
-        t0 = self.clock.now()
-        deadline = t0
-        while not done.done():
-            row = await self.command(command)
-            row.update({'segment': self.segment_index, 'phase': phase,
-                        't_local': self.clock.now() - t0})
-            row.update(info or {})
-            self.rows.append(row)
-            self.last_sample = row
-            deadline += period
-            await self.clock.sleep_until(max(deadline, self.clock.now()))
+        meta = _SegmentMeta(self.segment_index, phase, dict(info or {}), self.clock.now(), True)
+        await self._loop(meta, 1.0 / self.rate_hz, lambda t, s: command,
+                         lambda t, row: row is None and done.done())
         return done.result()
 
     async def brake(self, duration_s, phase='brake', info=None):
-        """moteus brake mode (shorted windings: passive damping), logged at rate.
+        """Drives in IDLE with grounded phases (passive damping), logged at rate.
 
-        Keeps commanding throughout, so the run never goes quiet. The next
+        Keeps commanding throughout, so the watchdog stays fed. The next
         position command re-captures the setpoint from wherever the joint is.
         """
         check_info(info)
-        period = 1.0 / self.rate_hz
         self.segment_index += 1
-        t0 = self.clock.now()
-        deadline = t0
-        while self.clock.now() - t0 < duration_s:
-            t_send = self.clock.now()
-            state = await self.controller.set_brake(query=True)
-            row = self._parse(state)
-            row.update({'time': self.clock.now(), 't_send': t_send, 'cmd_joint_deg': math.nan,
-                        'cmd_joint_vel_deg_s': 0.0, 'cmd_ff_torque_nm': 0.0, 'kp_scale': 0.0,
-                        'kd_scale': 0.0, 'kp_joint_nm_rad': 0.0, 'kd_joint_nms_rad': 0.0,
-                        'max_torque_nm': math.nan, 'segment': self.segment_index,
-                        'phase': phase, 't_local': t_send - t0})
-            row.update(info or {})
-            self.rows.append(row)
-            self.last_sample = row
-            reason = self.limits.check(row)
-            if reason:
-                self.abort_reason = reason
-                raise SafetyAbort(reason)
-            deadline += period
-            await self.clock.sleep_until(max(deadline, self.clock.now()))
+        meta = _SegmentMeta(self.segment_index, phase, dict(info or {}), self.clock.now(), True)
+        stop = Command(position_deg=math.nan, kp_scale=0.0, kd_scale=0.0)
+        await self._loop(meta, 1.0 / self.rate_hz, lambda t, s: stop,
+                         lambda t, row: row is None and t >= duration_s, brake=True)
         self.last_command = Command()
 
     async def prompt_while_holding(self, message, command: Command, phase='hold', info=None):
-        """Ask the operator for input while the controller keeps holding."""
+        """Ask the operator for input while the loop keeps holding."""
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(None, input, message)
         return await self.hold_until(future, command, phase, info)
+
+    async def set_gains(self, kp_joint_nm_rad, kd_joint_nms_rad):
+        """Joint-side PD gains for subsequent commands (applied by the loop every cycle)."""
+        self.kp_joint = kp_joint_nm_rad
+        self.kd_joint = kd_joint_nms_rad
+        self.log_event('set_gains', kp_joint_nm_rad=kp_joint_nm_rad,
+                       kd_joint_nms_rad=kd_joint_nms_rad)
 
     def current_position_deg(self):
         if self.last_sample is not None:
@@ -1042,13 +1027,14 @@ class MoteusSession:
         if self.is_sim:
             self.plant.lock_output()
             return
-        lines = ['', 'LOCK THE OUTPUT: clamp the handle/output link rigidly to the frame.']
+        lines = ['', f'LOCK THE OUTPUT: clamp the {self.joint} output link rigidly to the frame.']
         if note:
             lines.append(note)
         confirm(self.args, lines)
 
     def log_event(self, event, **fields):
-        self.events.append({'time': self.clock.now(), 'event': event, **fields})
+        t = self.clock.now() if self.wrist is not None else math.nan
+        self.events.append({'time': t, 'event': event, **fields})
 
     # --- saving ------------------------------------------------------------------------
     def save(self):
@@ -1069,16 +1055,20 @@ class MoteusSession:
             'simulated': self.is_sim,
             'run_started_utc': self._t_started,
             'num_samples': len(self.rows),
-            'target_rate_hz': self.rate_hz,
+            'target_rate_hz': self.loop_rate_hz,
+            'host_rate_hz': self.rate_hz,
+            'requested_rate_hz': self.requested_rate_hz,
             'measured_rate_hz': rate,
+            'joint': self.joint,
             'gear_ratio': self.N,
-            'start_pos_rev': self.start_rev,
+            'start_q_deg': [math.degrees(x) for x in self.start_q],
             'kp_joint_nm_rad': self.kp_joint,
             'kd_joint_nms_rad': self.kd_joint,
             'max_torque_nm': self.max_torque_nm,
-            'moteus_rotor_to_output_ratio_assumption': 1,
-            'moteus_config_snapshot': self.config_snapshot,
-            'moteus_config_changed_then_restored': self.original_config,
+            # The CST ramp applies a torque 2 SYNC periods after the position it
+            # came from (plus the drive's current loop, not included here).
+            'loop_delay_s': 2.0 * device_config.LOOP_PERIOD_S,
+            'velocity_filter_hz': device_config.VELOCITY_FILTER_HZ,
             'device_config': device_config_snapshot(),
             'experiment_config': self.config,
             'external_sensor': self.sensor.describe(),
@@ -1088,7 +1078,13 @@ class MoteusSession:
             **self.metadata,
         }
         if self.is_sim and self.plant is not None:
-            metadata['sim_truth'] = self.plant.truth()
+            metadata['sim_truth'] = self.plant.truth(self.j)
+            metadata['sim_params'] = asdict(self.plant.p)
         write_json(self.run_dir / f'{self.experiment}_metadata.json', metadata)
         status = 'complete' if self.completed else f'INCOMPLETE ({self.abort_reason})'
         print(f'Saved {len(self.rows)} samples to {data_path} [{status}]')
+
+
+def _inverse_transpose(m):
+    import numpy as np
+    return np.linalg.inv(np.array(m, dtype=float)).T.tolist()

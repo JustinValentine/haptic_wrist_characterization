@@ -68,7 +68,8 @@ def analyze_trials(run, thresholds):
         metrics = trial_metrics(frame['t_local'], frame['joint_pos_deg'], frame['cmd_joint_deg'],
                                 frame['joint_vel_deg_s'], frame['joint_torque_nm'],
                                 frame['control_joint_torque_nm'], frame['max_torque_nm'],
-                                f, ramp_s, steady_s)
+                                f, ramp_s, steady_s,
+                                torque_delay_s=float(run.meta.get('loop_delay_s') or 0.0))
         rows.append({'trial_id': trial_id, 'frequency_hz': f,
                      'command_setpoint_deg': float(frame['command_amplitude_deg'].iloc[0]),
                      'role': frame['role'].iloc[0],
@@ -352,7 +353,7 @@ def main(argv=None):
         'limit_lines': {'J_kg_m2': J, 'J_source': J_source, 'torque_cap_nm': cap,
                         'speed_deg_s': speed, 'range_deg': rom},
         'note': ('Amplitudes are joint-side (motor encoder / gear ratio). Torque is the '
-                 'moteus-reported torque; apply the torque calibration ratio if measured.'),
+                 'drive-reported torque; apply the torque calibration ratio if measured.'),
     }
     save_outputs(run, {'trials': trials, 'envelope': envelope}, summary, metadata)
 

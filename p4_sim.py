@@ -111,11 +111,14 @@ class SimParams:
 
 @dataclass
 class HumanModel:
-    """Operator who drags one joint along a reference through a spring-damper."""
-    motion: Callable[[float], tuple]      # t -> (theta_rad, omega_rad_s), absolute joint angle
-    joint: int = 0
+    """Operator who drags one joint along a reference through a spring-damper.
+
+    motion(t) gives (theta, omega) in rad relative to plant.human_origin; the
+    joint defaults to plant.test_joint (both set by the experiment session)."""
+    motion: Callable[[float], tuple]
     stiffness: float = 40.0
     damping: float = 0.8
+    joint: Optional[int] = None
 
 
 class WristPlant:
@@ -144,19 +147,22 @@ class WristPlant:
         self.temp_board = [p.ambient_temperature] * 3
         self.locked = [None] * 3               # locked output angle per joint
         self.human: Optional[HumanModel] = None
-        self.current = [0.0] * 3               # reported q current (A), set by the pucks
+        self.test_joint = 0                    # joint under test (set by the session)
+        self.human_origin = 0.0                # rad, where the human's motion is centred
 
     # --- operator interaction ----------------------------------------------
-    def lock_output(self, joint, angle=None):
+    def lock_output(self, joint=None, angle=None):
+        joint = self.test_joint if joint is None else joint
         self.locked[joint] = self.q[joint] if angle is None else angle
         self.q[joint] = self.locked[joint]
         self.wq[joint] = 0.0
 
-    def unlock_output(self, joint):
-        self.locked[joint] = None
+    def unlock_output(self, joint=None):
+        self.locked[self.test_joint if joint is None else joint] = None
 
-    def external_torque(self, joint):
+    def external_torque(self, joint=None):
         """What an external sensor at the handle (or the lock) reads, N m."""
+        joint = self.test_joint if joint is None else joint
         value = self.tau_t[joint] if self.locked[joint] is not None else self.tau_h[joint]
         return value + self.rng.normal(0.0, self.p.external_sensor_noise)
 
@@ -187,6 +193,8 @@ class WristPlant:
         m, wm, q, wq = self.m, self.wm, self.q, self.wq
         stuck, tau_act = self.stuck, self.tau_act
         human = self.human
+        human_joint = (self.test_joint if human is None or human.joint is None else human.joint)
+        origin = self.human_origin
         tau_t = self.tau_t
         tau_h = [0.0, 0.0, 0.0]
         sum_i2 = [0.0, 0.0, 0.0]
@@ -249,9 +257,9 @@ class WristPlant:
                 ext_o = tau_t[j] - bo[j] * wq[j]
                 if mgl[j]:
                     ext_o -= mgl[j] * math.sin(q[j])
-                if human is not None and human.joint == j:
+                if human is not None and human_joint == j:
                     th, om = human.motion(t)
-                    tau_h[j] = human.stiffness * (th - q[j]) + human.damping * (om - wq[j])
+                    tau_h[j] = human.stiffness * (origin + th - q[j]) + human.damping * (om - wq[j])
                     ext_o += tau_h[j]
                 wq[j] += h * ext_o / Jo[j]
                 q[j] += h * wq[j]
@@ -374,7 +382,7 @@ class SimP4(MockP4):
         od[OD.ACTUAL_POSITION.addr] = int(math.floor((self.angle - self.counter_origin) * cpr / TWO_PI + 0.5))
         st = p.arr('single_turn_offset')[self.motor] + _three(p.single_turn_dir)[self.motor] * self.angle * cpr / TWO_PI
         od[OD.RAW_ENCODER.addr] = int(math.floor(st + 0.5)) % cpr
-        applied = self.ramp[0]   # torque at this instant (start of the next ramp)
+        applied = self.ramp[1]   # torque now: where the ramp in progress (or just finished) ends
         kt = p.kt_si()[self.motor]
         peak = p.arr('peak_current_ma')[self.motor] / 1000.0
         od[OD.ACTUAL_CURRENT.addr] = int(round(applied / kt / peak * 1000.0)) if self.ramp_mode == DRIVE_TORQUE else 0
@@ -547,6 +555,7 @@ class SimBus:
             puck.counter_origin = puck.angle
             self.pucks.append(puck)
         self.sent = collections.Counter()
+        self.sync_hooks = []        # called after the plant advances, once per SYNC
 
     def period(self):
         us = self.pucks[0].od[(0x1006, 0)]
@@ -583,6 +592,8 @@ class SimBus:
 
     def _sync(self):
         self._advance(self.period())
+        for hook in self.sync_hooks:
+            hook()
         for puck in self.pucks:
             if puck.dropped:
                 continue

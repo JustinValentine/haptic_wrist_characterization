@@ -15,28 +15,29 @@ import math
 from dataclasses import asdict, dataclass
 
 import device_config
-from experiment_common import (MoteusSession, confirm, describe_plan, hold, make_arg_parser,
+from experiment_common import (WristSession, confirm, describe_plan, hold, make_arg_parser,
                                min_jerk_move, run_cli)
 
 EXPERIMENT = 'closed_loop_step'
-SIM_PARAMS = None   # Tests may inject a moteus_sim.SimParams
+SIM_PARAMS = None   # Tests may inject a p4_sim.SimParams
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class ClosedLoopStepConfig:
-    kp_joint_nm_rad: float = 450.0          # Same stiff gains as the bandwidth test
-    kd_joint_nms_rad: float = 0.75
-    step_sizes_deg: tuple = (1.0, 2.0, 5.0, 10.0, 20.0)   # 1 deg stays below the cap
+    kp_joint_nm_rad: float = 80.0           # Same stiff gains as the bandwidth test
+    kd_joint_nms_rad: float = 1.0 
+    step_sizes_deg: tuple = (1.0, 2.0, 5.0, 10.0)   # 1 deg stays below the cap; 10 deg
+                                                 # saturates long enough to fit
     steps_per_size: int = 6                 # Alternating up/down steps per size
     center_deg: float = 0.0
     hold_s: float = 1.0                     # Per step; long enough to settle
     settle_s: float = 0.5                   # Before each block of steps
     reposition_speed_deg_s: float = 60.0
-    sample_rate_hz: float = 1000.0
+    sample_rate_hz: float = 500.0
 
 
-QUICK = dict(step_sizes_deg=(1.0, 5.0, 20.0), steps_per_size=2, hold_s=0.6, settle_s=0.3)
+QUICK = dict(step_sizes_deg=(1.0, 5.0, 10.0), steps_per_size=2, hold_s=0.6, settle_s=0.3)
 
 
 def build_segments(cfg):
@@ -93,7 +94,7 @@ async def main(args):
     cfg = ClosedLoopStepConfig(**(QUICK if args.quick else {}))
     segments = build_segments(cfg)
     lines = plan_lines(cfg, device_config.MAX_JOINT_TORQUE_NM)
-    async with MoteusSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
+    async with WristSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
         confirm(args, ['Closed-loop step performance (stiff PD, torque cap engaged)',

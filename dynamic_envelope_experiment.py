@@ -36,18 +36,18 @@ import numpy as np
 
 import device_config
 from analysis_common import fit_sinusoids
-from experiment_common import (Command, MoteusSession, Segment, confirm, hold, latest_summary,
+from experiment_common import (Command, WristSession, Segment, confirm, hold, latest_summary,
                                make_arg_parser, min_jerk_move, run_cli)
 
 EXPERIMENT = 'dynamic_envelope'
-SIM_PARAMS = None   # Tests may inject a moteus_sim.SimParams
+SIM_PARAMS = None   # Tests may inject a p4_sim.SimParams
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class EnvelopeConfig:
-    kp_joint_nm_rad: float = 450.0          # Stiff PD (bandwidth-test gains)
-    kd_joint_nms_rad: float = 0.75
+    kp_joint_nm_rad: float = 80.0           # Stiff PD (bandwidth-test gains)
+    kd_joint_nms_rad: float = 1.0 
     send_velocity_feedforward: bool = True
     frequencies_hz: tuple = (0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0)
     reference_fraction: float = 0.1         # Small-signal reference / predicted limit
@@ -73,7 +73,7 @@ class EnvelopeConfig:
     reference_regions: tuple = ()           # Optional shaded regions for the figure:
     # ({'label': ..., 'f_min': ..., 'f_max': ..., 'amp_min': ..., 'amp_max': ...}, ...)
     # with amplitudes in deg; cite your source in the caption.
-    sample_rate_hz: float = 1000.0
+    sample_rate_hz: float = 500.0
 
 
 QUICK = dict(frequencies_hz=(1.0, 8.0, 16.0), ramp_periods=1.0, min_ramp_s=0.2,
@@ -196,8 +196,12 @@ def make_guard(center, cfg):
 
 
 def trial_metrics(t, joint_deg, command_deg, joint_vel_deg_s, measured_torque_nm,
-                  control_torque_nm, cap_nm, f, ramp_s, steady_s):
-    """Steady-window response at f: gain, phase, distortion, torque use."""
+                  control_torque_nm, cap_nm, f, ramp_s, steady_s, torque_delay_s=0.0):
+    """Steady-window response at f: gain, phase, distortion, torque use.
+
+    torque_delay_s: how long a controller torque takes to be delivered (the
+    p4wrist loop: 2 SYNC periods). The measured torque is compared with the
+    controller's that long before, or every fast trial would look current-limited."""
     t = np.asarray(t, dtype=float)
     sel = (t >= ramp_s) & (t < ramp_s + steady_s)
     dt = float(np.median(np.diff(t))) if len(t) > 1 else 0.0
@@ -209,14 +213,18 @@ def trial_metrics(t, joint_deg, command_deg, joint_vel_deg_s, measured_torque_nm
     G = Y[0] / U[0]
     error = (np.asarray(joint_deg, float) - np.asarray(command_deg, float))[sel]
     error = error - error.mean()
-    control = np.abs(np.asarray(control_torque_nm, float)[sel])
+    control_all = np.asarray(control_torque_nm, float)
+    control = np.abs(control_all[sel])
+    delivered_control = control
+    if torque_delay_s > 0:
+        delivered_control = np.abs(np.interp(t[sel] - torque_delay_s, t, control_all))
     measured = np.abs(np.asarray(measured_torque_nm, float)[sel])
     cap = np.abs(np.asarray(cap_nm, float)[sel])
     velocity = np.asarray(joint_vel_deg_s, float)[sel]
     power = np.abs(np.asarray(measured_torque_nm, float)[sel] * np.radians(velocity))
     valid = np.isfinite(control) & np.isfinite(cap) & (cap > 0)
     saturated = control[valid] >= SATURATION_THRESHOLD * cap[valid]
-    shortfall = (control[valid] - measured[valid]) > SHORTFALL_THRESHOLD * cap[valid]
+    shortfall = (delivered_control[valid] - measured[valid]) > SHORTFALL_THRESHOLD * cap[valid]
     return {
         'command_amplitude_deg': float(abs(U[0])),
         'joint_amplitude_deg': float(abs(Y[0])),
@@ -275,7 +283,8 @@ def metrics_from_rows(rows, f, ramp_s, steady_s):
         [r['t_local'] for r in rows], [r['joint_pos_deg'] for r in rows],
         [r['cmd_joint_deg'] for r in rows], [r['joint_vel_deg_s'] for r in rows],
         [r['joint_torque_nm'] for r in rows], [r['control_joint_torque_nm'] for r in rows],
-        [r['max_torque_nm'] for r in rows], f, ramp_s, steady_s)
+        [r['max_torque_nm'] for r in rows], f, ramp_s, steady_s,
+        torque_delay_s=2.0 * device_config.LOOP_PERIOD_S)
 
 
 async def run_trial(session, cfg, plan, amplitude, role, trial_id, reference, thresholds):
@@ -381,7 +390,7 @@ async def main(args):
                      f"{p['predicted_command_deg']:6.2f} deg command ({p['predicted_binding']}), "
                      f"cap {p['cap_command_deg']:6.2f} deg")
     lines.append('  Large, fast oscillations at full torque: keep hands, cables and people clear.')
-    async with MoteusSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
+    async with WristSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
         confirm(args, lines)

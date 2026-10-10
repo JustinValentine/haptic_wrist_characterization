@@ -6,7 +6,7 @@ Per step (normalized response s = (y - y0) / (target - y0)):
   cogging leave a steady-state error, reported separately) and into an absolute
   band around the target;
 * steady-state error (mean of the last 20% of the hold);
-* peak velocity (moteus estimate), peak acceleration (Savitzky-Golay
+* peak velocity (the loop's filtered estimate), peak acceleration (Savitzky-Golay
   derivative of velocity), peak torque, peak mechanical power;
 * torque saturation: fraction of samples with the controller torque at the
   cap, and the acceleration the joint achieves per unit of torque over the
@@ -51,7 +51,7 @@ SATURATION_THRESHOLD = 0.98      # |controller torque| >= this * cap counts as s
 MIN_SATURATED_S = 0.003          # Shorter saturation is not counted as a saturated step
 ACCEL_WINDOW_S = 0.006           # Savitzky-Golay window for the acceleration estimate
 ACCEL_FIT_SKIP_S = 0.002         # Skip the torque rise at saturation onset
-ACCEL_FIT_MIN_S = 0.015          # Shorter motoring intervals are not fitted
+ACCEL_FIT_MIN_S = 0.010          # Shorter motoring intervals are not fitted (5 samples at 500 Hz)
 KNEE_FRACTION = 0.95             # Delivered torque below this fraction of the cap = derated
 
 

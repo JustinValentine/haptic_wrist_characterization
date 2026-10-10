@@ -4,16 +4,20 @@ import unittest
 
 import numpy as np
 import pandas as pd
-from tests.helpers import rel_err, run_analysis, run_sim_experiment, scratch_dir
+from tests.helpers import (frictionless, loop_velocity_path, rel_err, run_analysis,
+                           run_sim_experiment, scratch_dir)
 
 import schroeder_bandwidth_experiment
 import schroeder_bandwidth_experiment_analysis as analysis
 
 
-def true_model(freqs, truth, kp, kd, ff=1.0):
+def true_model(freqs, truth, kp, kd, meta, ff=1.0):
+    """The rigid joint under the p4wrist loop: torque 2 SYNC periods (plus the
+    current loop) after its sample, damping on a differenced, filtered velocity."""
     J = truth['motor_inertia'] + truth['output_inertia']
     b = truth['viscous'] + truth['output_viscous']
-    return analysis.model_response(freqs, J, b, 0.0, kp, kd, ff)
+    tau = meta['loop_delay_s'] + truth['current_loop_time_constant']
+    return analysis.model_response(freqs, J, b, tau, kp, kd, ff, loop_velocity_path(meta))
 
 
 def write_legacy_run(directory, kp=450.0, kd=0.75, J=0.008, b=0.022):
@@ -47,26 +51,35 @@ def write_legacy_run(directory, kp=450.0, kd=0.75, J=0.008, b=0.022):
 
 class BandwidthTest(unittest.TestCase):
     def test_frequency_response_matches_plant(self):
-        with scratch_dir() as tmp:
-            run_dir = run_sim_experiment(schroeder_bandwidth_experiment, tmp / 'run')
-            meta = json.loads((run_dir / 'bandwidth_metadata.json').read_text())
-            self.assertTrue(meta['completed'])
-            truth = meta['sim_truth']
-            summary = run_analysis(analysis, run_dir)
-            response = pd.read_csv(run_dir / 'analysis' / 'frequency_response.csv')
+        # Coulomb friction makes small-amplitude responses non-linear; without it
+        # the measured response must match the linear model of plant and loop.
+        schroeder_bandwidth_experiment.SIM_PARAMS = frictionless()
+        try:
+            with scratch_dir() as tmp:
+                run_dir = run_sim_experiment(schroeder_bandwidth_experiment, tmp / 'run')
+                meta = json.loads((run_dir / 'bandwidth_metadata.json').read_text())
+                self.assertTrue(meta['completed'])
+                truth = meta['sim_truth']
+                summary = run_analysis(analysis, run_dir)
+                response = pd.read_csv(run_dir / 'analysis' / 'frequency_response.csv')
+        finally:
+            schroeder_bandwidth_experiment.SIM_PARAMS = None
 
         kp, kd = summary['kp_joint_nm_rad'], summary['kd_joint_nms_rad']
         J_true = truth['motor_inertia'] + truth['output_inertia']
-        self.assertLess(rel_err(summary['fit_J_kg_m2'], J_true), 0.10)
+        # J and b trade off when Kd dominates the loop damping: J is loose here;
+        # the step response measures it to a few percent.
+        self.assertLess(rel_err(summary['fit_J_kg_m2'], J_true), 0.15)
+        self.assertTrue(summary['fit_delay_fixed'])
         self.assertEqual(summary['num_levels_valid'], summary['num_levels'])
-        # With Kp = 450 N m/rad the -3 dB point lies beyond the 30 Hz band.
+        # With velocity feedforward the -3 dB point lies beyond the 30 Hz band.
         self.assertTrue(summary['bandwidth_above_range'])
         self.assertGreater(summary['fit_bandwidth_hz'], 30.0)
 
         valid = response[response['line_valid'] & response['level_valid']]
         H = valid['H_real'].to_numpy() + 1j * valid['H_imag'].to_numpy()
         error_db = 20 * np.log10(np.abs(H) / np.abs(
-            true_model(valid['frequency_hz'].to_numpy(), truth, kp, kd)))
+            true_model(valid['frequency_hz'].to_numpy(), truth, kp, kd, meta)))
         self.assertLess(np.max(np.abs(error_db)), 1.0)
 
     def test_legacy_single_period_data(self):

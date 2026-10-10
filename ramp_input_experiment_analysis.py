@@ -198,9 +198,9 @@ def detect_breakaway(ramp_id, ramp, kp, threshold_deg):
         'torque_signed_nm': spring_torque,
         'torque_nm': direction * spring_torque,
         'torque_threshold_nm': direction * threshold_torque,
-        'moteus_control_torque_nm': (float(ramp['control_joint_torque_nm'].iloc[onset])
+        'control_torque_nm': (float(ramp['control_joint_torque_nm'].iloc[onset])
                                      if 'control_joint_torque_nm' in ramp.columns else math.nan),
-        'moteus_measured_torque_nm': (float(ramp['joint_torque_nm'].iloc[onset])
+        'measured_torque_nm': (float(ramp['joint_torque_nm'].iloc[onset])
                                       if 'joint_torque_nm' in ramp.columns else math.nan),
         'motor_pos_rev': (float(np.interp(t0, t, ramp['motor_pos_rev'].to_numpy()))
                           if 'motor_pos_rev' in ramp.columns else math.nan),
@@ -425,7 +425,7 @@ def main(argv=None):
         'min_threshold_deg': MIN_THRESHOLD_DEG,
         'onset_fraction': ONSET_FRACTION,
         'stuck_window_s': STUCK_WINDOW_S,
-        'note': ('Torques are in the torque scale moteus applies (Kp in N m/rad); multiply by '
+        'note': ('Torques are in the torque scale the drives apply (Kp in N m/rad); multiply by '
                  'the torque calibration ratio if one was measured.'),
     }
     save_outputs(run, {'breakaway_events': results}, summary, metadata)

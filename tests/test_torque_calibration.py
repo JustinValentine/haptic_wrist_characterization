@@ -72,7 +72,7 @@ class TorqueCalibrationTest(unittest.TestCase):
 
     def test_unlocked_output_aborts_at_lock_check(self):
         with scratch_dir() as tmp, mock.patch.object(
-                experiment_common.MoteusSession, 'require_locked_output',
+                experiment_common.WristSession, 'require_locked_output',
                 lambda self, note='': None):
             with self.assertRaises(experiment_common.SafetyAbort):
                 run_sim_experiment(experiment, tmp / 'run')

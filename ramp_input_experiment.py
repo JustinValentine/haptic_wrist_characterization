@@ -14,11 +14,11 @@ import math
 from dataclasses import asdict, dataclass
 
 import device_config
-from experiment_common import (Command, MoteusSession, Segment, confirm, describe_plan, hold,
+from experiment_common import (Command, WristSession, Segment, confirm, describe_plan, hold,
                                make_arg_parser, run_cli)
 
 EXPERIMENT = 'friction_ramp'
-SIM_PARAMS = None   # Tests can inject a moteus_sim.SimParams here.
+SIM_PARAMS = None   # Tests can inject a p4_sim.SimParams here.
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
@@ -31,7 +31,7 @@ class RampConfig:
     workspace_limit_deg: float = 45.0    # Staircase spans +/- this
     cycles: int = 1                      # Repeats of the full staircase
     settle_s: float = 2.0
-    sample_rate_hz: float = 1000.0
+    sample_rate_hz: float = 500.0
 
 
 QUICK = dict(workspace_limit_deg=15.0, cycles=1, settle_s=1.0)
@@ -104,7 +104,7 @@ async def main(args):
     cfg = RampConfig(**(QUICK if args.quick else {}))
     segments = build_segments(cfg)
     warnings = plan_warnings(cfg)
-    async with MoteusSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, 0.0, config=asdict(cfg),
+    async with WristSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, 0.0, config=asdict(cfg),
                              rate_hz=cfg.sample_rate_hz, sim_params=SIM_PARAMS) as session:
         confirm(args, ['Static friction ramp-and-hold (P-only, Kd = 0)',
                        f'  +/-{cfg.workspace_limit_deg} deg in {cfg.ramp_step_deg} deg ramps, '

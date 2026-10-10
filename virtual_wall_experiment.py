@@ -4,8 +4,8 @@ The wrist launches itself, under stiff tracking, into a unilateral virtual
 wall at WALL_DEG and is released just before contact, so the impact is
 governed by the wall alone:
 
-    'moteus' mode:  moteus stay-within mode with the upper bound at the wall;
-                    the firmware renders K and B at its internal rate.
+    'rt' mode:      the p4wrist loop's stay-within mode with the upper bound
+                    at the wall; the loop renders K and B at 500 Hz.
     'host_<rate>':  the host computes tau = -K (th - th_w) - B th' while the
                     joint is inside the wall, from the previous sample, and
                     sends it as feedforward torque (a PC-side haptic loop).
@@ -29,18 +29,18 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 import device_config
-from experiment_common import (Command, MoteusSession, Segment, confirm, hold, latest_summary,
+from experiment_common import (Command, WristSession, Segment, confirm, hold, latest_summary,
                                make_arg_parser, min_jerk_move, run_cli)
 
 EXPERIMENT = 'virtual_wall'
-SIM_PARAMS = None   # Tests may inject a moteus_sim.SimParams
+SIM_PARAMS = None   # Tests may inject a p4_sim.SimParams
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class VirtualWallConfig:
-    modes: tuple = ('moteus', 'host_1000')   # 'moteus' and/or 'host_<rate_hz>' (max 3)
-    stiffness_nm_rad: tuple = (20.0, 50.0, 100.0, 200.0, 500.0, 1000.0)
+    modes: tuple = ('rt', 'host_250')   # 'rt' and/or 'host_<rate_hz>' (max 3)
+    stiffness_nm_rad: tuple = (10.0, 20.0, 50.0, 100.0, 200.0, 500.0)
     damping_nms_rad: tuple = (0.0, 0.1)
     impact_speeds_deg_s: tuple = (60.0, 120.0)
     repeats: int = 2
@@ -48,8 +48,8 @@ class VirtualWallConfig:
     release_before_deg: float = 1.5          # Tracking stops this far before the wall
     approach_accel_deg_s2: float = 1500.0    # Peak acceleration of the run-up
     cruise_s: float = 0.12                   # Constant-speed run-up before release
-    tracking_k_nm_rad: float = 200.0         # Approach/return tracking gains
-    tracking_b_nms_rad: float = 1.0
+    tracking_k_nm_rad: float = 60.0          # Approach/return tracking gains (stable in the
+    tracking_b_nms_rad: float = 0.8          # 500 Hz loop)
     catch_s: float = 0.08                    # Keep rendering after leaving the wall
     max_wall_s: float = 1.0                  # Longest wall phase (e.g. joint stuck inside)
     catch_speed_deg_s: float = 5.0           # Damped catch ends below this speed
@@ -61,13 +61,13 @@ class VirtualWallConfig:
     max_contacts: int = 4                    # More contacts in one trial = chatter
     restitution_stop: float = 2.0            # Stop raising K once e exceeds this
     torque_cap_fraction: float = 0.9         # Of the device torque cap, during the wall
-    sample_rate_hz: float = 1000.0           # Approach, return, and moteus-mode logging
+    sample_rate_hz: float = 500.0            # Approach, return, and rt-mode logging
 
 
 QUICK = dict(stiffness_nm_rad=(20.0, 100.0, 500.0), damping_nms_rad=(0.0,),
              impact_speeds_deg_s=(120.0,), repeats=1, settle_s=0.2)
 
-VEL_WINDOW_S = 0.005        # Position-slope window for entry/exit speeds
+VEL_WINDOW_S = 0.010        # Position-slope window for entry/exit speeds (5 samples at 500 Hz)
 RH_WINDOW_FRACTION = 0.25   # Rate-hardness window: first quarter of the contact ...
 RH_WINDOW_MIN_S = 0.002     # ... clipped to [min, max]
 RH_WINDOW_MAX_S = 0.020
@@ -77,15 +77,15 @@ UNSTABLE_REASONS = ('penetration limit', 'velocity limit', 'chatter')
 
 
 def parse_mode(name, cfg):
-    if name == 'moteus':
-        return {'name': name, 'renderer': 'moteus', 'rate_hz': cfg.sample_rate_hz}
+    if name == 'rt':
+        return {'name': name, 'renderer': 'rt', 'rate_hz': cfg.sample_rate_hz}
     if name.startswith('host_'):
         try:
             rate = float(name.split('_', 1)[1])
         except ValueError:
-            raise SystemExit(f'Bad mode {name!r}; use host_<rate_hz>, e.g. host_1000.')
+            raise SystemExit(f'Bad mode {name!r}; use host_<rate_hz>, e.g. host_250.')
         return {'name': name, 'renderer': 'host', 'rate_hz': rate}
-    raise SystemExit(f'Unknown mode {name!r}; use "moteus" or "host_<rate_hz>".')
+    raise SystemExit(f'Unknown mode {name!r}; use "rt" or "host_<rate_hz>".')
 
 
 # --- impact metrics (also used by the analysis) --------------------------------------
@@ -109,7 +109,7 @@ def impact_metrics(t, pos_deg, torque_nm, wall_deg, inertia, coulomb_nm=0.0, vis
     (negative pushes out of the wall); inertia: kg m^2 for the energy terms.
     Velocities are position slopes over VEL_WINDOW_S just before entry and
     just after the wall torque has released (a delayed wall keeps pushing past
-    exit), so they do not depend on the moteus velocity filter.
+    exit), so they do not depend on the loop's velocity filter.
     """
     t = np.asarray(t, dtype=float)
     p = np.asarray(pos_deg, dtype=float) - wall_deg
@@ -131,7 +131,7 @@ def impact_metrics(t, pos_deg, torque_nm, wall_deg, inertia, coulomb_nm=0.0, vis
     out['contact'] = True
     i_in = int(entries[0])
     t_in = _crossing(t, p, i_in)
-    pre = (t >= t_in - VEL_WINDOW_S) & (t < t_in)
+    pre = (t >= t_in - VEL_WINDOW_S - 1e-9) & (t < t_in)
     v_in = _slope(t[pre], p[pre])
     out.update({'t_in_s': t_in, 'v_in_deg_s': v_in})
     after = np.flatnonzero(~inside[i_in:])
@@ -155,7 +155,9 @@ def impact_metrics(t, pos_deg, torque_nm, wall_deg, inertia, coulomb_nm=0.0, vis
         quiet = np.flatnonzero(np.abs(tau[i_out:]) < RELEASE_FRACTION * max(peak, 1e-9))
         i_off = i_out + int(quiet[0]) if quiet.size else len(t)
         t_off = float(t[min(i_off, len(t) - 1)])
-        post = (t > t_off) & (t <= t_off + VEL_WINDOW_S)
+        # (+1 ns: on a regular sample clock the window edge lands on a sample,
+        # whose time must not depend on rounding, e.g. a CSV round trip.)
+        post = (t > t_off) & (t <= t_off + VEL_WINDOW_S + 1e-9)
         v_out = _slope(t[post], p[post])
         out.update({'exited': True, 't_out_s': t_out, 'v_out_deg_s': v_out,
                     'contact_ms': 1e3 * (t_out - t_in),
@@ -242,7 +244,7 @@ def run_up_start(cfg, speed):
 
 
 def wall_command(mode, K, B, wall_deg, base, cap):
-    if mode['renderer'] == 'moteus':
+    if mode['renderer'] == 'rt':
         cmd = Command(stay_within=(math.nan, wall_deg), torque_nm=0.0,
                       kp_scale=K / base[0], kd_scale=(B / base[1]) if base[1] > 0 else 0.0,
                       max_torque_nm=cap)
@@ -366,7 +368,7 @@ async def run_trial(session, cfg, mode, K, B, speed, repeat, trial_id, base, cap
 
 
 def base_gains(cfg, mode, K, B):
-    if mode['renderer'] == 'moteus':
+    if mode['renderer'] == 'rt':
         return max(cfg.tracking_k_nm_rad, K), max(cfg.tracking_b_nms_rad, B)
     return cfg.tracking_k_nm_rad, cfg.tracking_b_nms_rad
 
@@ -438,7 +440,7 @@ async def main(args):
     params = reference_params(args.sim)
     n_max = (len(modes) * len(cfg.damping_nms_rad) * len(cfg.impact_speeds_deg_s)
              * len(cfg.stiffness_nm_rad) * cfg.repeats)
-    async with MoteusSession(EXPERIMENT, args, cfg.tracking_k_nm_rad, cfg.tracking_b_nms_rad,
+    async with WristSession(EXPERIMENT, args, cfg.tracking_k_nm_rad, cfg.tracking_b_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
         cap = cfg.torque_cap_fraction * session.max_torque_nm

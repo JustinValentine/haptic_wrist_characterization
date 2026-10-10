@@ -35,8 +35,8 @@ DIAGNOSTIC_BASENAME = 'diag_zwidth_trials'
 
 
 def mode_label(name):
-    if name == 'moteus':
-        return 'moteus position loop'
+    if name == 'rt':
+        return '500 Hz loop'
     if name.startswith('host_'):
         rate = float(name.split('_', 1)[1])
         return f'Host loop, {rate / 1000:g} kHz' if rate >= 1000 else f'Host loop, {rate:g} Hz'
@@ -77,7 +77,7 @@ def classify_all(run):
         rows.append({
             'trial_id': trial_id,
             # 'render_mode' (older runs logged it as 'mode', which overwrote the
-            # moteus mode-register column).
+            # logged mode column).
             'mode': (frame['render_mode'] if 'render_mode' in frame else frame['mode']).iloc[0],
             'virtual_b_nms_rad': float(frame['virtual_b_nms_rad'].iloc[0]),
             'virtual_k_nm_rad': float(frame['virtual_k_nm_rad'].iloc[0]),

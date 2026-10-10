@@ -1,5 +1,4 @@
 import json
-import math
 import unittest
 
 import pandas as pd
@@ -11,7 +10,7 @@ import virtual_wall_experiment_analysis
 
 
 class VirtualWallTest(unittest.TestCase):
-    def test_firmware_wall_is_passive_and_host_wall_injects_energy(self):
+    def test_wall_energy_follows_loop_delay(self):
         with scratch_dir() as tmp:
             run_dir = run_sim_experiment(virtual_wall_experiment, tmp / 'run')
             meta = json.loads((run_dir / 'virtual_wall_metadata.json').read_text())
@@ -34,26 +33,27 @@ class VirtualWallTest(unittest.TestCase):
 
         e = impacts.groupby(['mode', 'virtual_k_nm_rad'])['restitution'].mean()
         ks = sorted(impacts['virtual_k_nm_rad'].unique())
-        # The firmware wall (no host delay) is passive (nearly lossless when very
-        # stiff, hence the 2% margin); the 1 kHz host loop's delay makes stiff
-        # walls launch the handle back faster than it came.
+        # Both loops are delayed, so stiffer walls give back more energy; the 250 Hz
+        # host loop's longer delay gives back more than the 500 Hz loop at every K.
+        # With b ~ 0.02 N m s/rad the loop's wall is passive only below ~b/(T/2) =
+        # 10 N m/rad by Colgate's bound; friction keeps K = 20 passive in practice.
+        rt = [e[('rt', k)] for k in ks]
+        self.assertEqual(rt, sorted(rt))
+        self.assertLess(e[('rt', ks[0])], 1.0)
+        self.assertGreater(rt[-1], 1.0)
         for k in ks:
-            self.assertLess(e[('moteus', k)], 1.0 if k <= 100 else 1.02)
-            if k >= 100:
-                self.assertLess(e[('moteus', k)], e[('host_1000', k)])
-        host = [e[('host_1000', k)] for k in ks]
-        self.assertEqual(host, sorted(host))
-        self.assertGreater(host[-1], 1.0)
+            if ('host_250', k) in e:
+                self.assertGreater(e[('host_250', k)], e[('rt', k)])
+        self.assertLessEqual(summary['first_active_k_host_250_nm_rad'],
+                             summary['first_active_k_rt_nm_rad'])
+        self.assertGreaterEqual(summary['max_passive_k_rt_nm_rad'], 20.0)
 
-        # Rate-hardness of a delay-free spring tracks the commanded stiffness.
-        moteus = impacts[impacts['mode'] == 'moteus']
-        for _, row in moteus.iterrows():
-            self.assertLess(abs(row['rate_hardness_nm_rad'] / row['virtual_k_nm_rad'] - 1.0), 0.3)
-
-        self.assertGreaterEqual(summary['max_passive_k_moteus_nm_rad'], 100.0)
-        self.assertTrue(math.isfinite(summary['first_active_k_host_1000_nm_rad']))
-        self.assertGreater(summary['torque_delay_host_1000_median_ms'],
-                           summary['torque_delay_moteus_median_ms'] + 1.0)
+        # The loop's measured torque delay is its CST delay (2 SYNC periods); the
+        # host loop adds its own.
+        self.assertAlmostEqual(summary['torque_delay_rt_median_ms'],
+                               1000.0 * meta['loop_delay_s'], delta=1.0)
+        self.assertGreater(summary['torque_delay_host_250_median_ms'],
+                           summary['torque_delay_rt_median_ms'] + 1.0)
 
 
 if __name__ == '__main__':

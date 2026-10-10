@@ -50,8 +50,8 @@ METRICS = ['restitution', 'wall_work_mj', 'wall_energy_gain_percent', 'rate_hard
 
 
 def mode_label(name):
-    if name == 'moteus':
-        return 'moteus firmware wall'
+    if name == 'rt':
+        return '500 Hz loop wall'
     if name.startswith('host_'):
         rate = float(name.split('_', 1)[1])
         return f'Host loop, {rate / 1000:g} kHz' if rate >= 1000 else f'Host loop, {rate:g} Hz'
@@ -341,7 +341,7 @@ def main(argv=None):
                                 'speed_deg_s': summary['reference_speed_deg_s']},
         'energy_reference': {'J_kg_m2': inertia, 'coulomb_nm': coulomb,
                              'viscous_nms_rad': viscous, 'source': source},
-        'note': ('Unloaded impacts (handle free). Torques are in the torque scale moteus '
+        'note': ('Unloaded impacts (handle free). Torques are in the torque scale the drives '
                  'reports; e and the wall-work percentage are scale-free ratios. '
                  'wall_work_balance_mj (kinetic energy change + modeled friction loss) is a '
                  'model-based cross-check of the directly integrated wall work.'),
@@ -368,7 +368,7 @@ def main(argv=None):
               f"N m/rad; first active K: {summary[f'first_active_k_{mode}_nm_rad']:.4g} N m/rad; "
               f"median torque delay {summary[f'torque_delay_{mode}_median_ms']:.2f} ms")
     if sim_truth(run):
-        print('Simulated run: no closed-form truth for restitution; expect firmware walls with '
+        print('Simulated run: no closed-form truth for restitution; expect 500 Hz loop walls with '
               'e < 1 and host-loop walls with e > 1 once K x loop delay exceeds the damping.')
 
     examples = example_impacts(run, impacts, modes, summary['reference_b_nms_rad'],

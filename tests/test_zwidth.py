@@ -26,16 +26,17 @@ class ZWidthTest(unittest.TestCase):
 
         boundary = {(b['mode'], b['virtual_b_nms_rad']): b for b in meta['boundary']}
         b_values = sorted({b for _, b in boundary})
-        host_low = boundary[('host_1000', b_values[0])]['k_last_stable_nm_rad']
-        host_high = boundary[('host_1000', b_values[-1])]['k_last_stable_nm_rad']
-        moteus_low = boundary[('moteus', b_values[0])]['k_last_stable_nm_rad']
+        host_low = boundary[('host_250', b_values[0])]['k_last_stable_nm_rad']
+        host_high = boundary[('host_250', b_values[-1])]['k_last_stable_nm_rad']
+        rt_low = boundary[('rt', b_values[0])]['k_last_stable_nm_rad']
         # Virtual damping extends the host loop's stable stiffness range, and the
-        # firmware loop (no host delay) renders far stiffer springs.
+        # 500 Hz loop (4 ms delay against the host loop's ~8 ms) renders stiffer
+        # springs, by about the ratio of the delays.
         self.assertIsNotNone(host_low)
         self.assertGreater(host_high, host_low)
-        self.assertGreater(moteus_low, 5 * host_low)
-        self.assertFalse(math.isnan(summary['zwidth_k_max_host_1000_b0_nm_rad']))
-        self.assertAlmostEqual(summary['zwidth_k_max_host_1000_b0_nm_rad'], host_low)
+        self.assertGreater(rt_low, 1.5 * host_low)
+        self.assertFalse(math.isnan(summary['zwidth_k_max_host_250_b0_nm_rad']))
+        self.assertAlmostEqual(summary['zwidth_k_max_host_250_b0_nm_rad'], host_low)
 
 
 if __name__ == '__main__':

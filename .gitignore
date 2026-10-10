@@ -9,3 +9,4 @@ __pycache__/
 # consider archiving raw data outside git if the repository grows.
 data/*/*_sim/
 p4wrist/build/
+data/p4wrist_zero_record.json

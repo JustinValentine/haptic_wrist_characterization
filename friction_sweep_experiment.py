@@ -3,7 +3,7 @@
 A stiff PD controller with velocity feedforward drives the joint through
 constant-velocity passes across a position window, in both directions, at
 log-spaced speeds. During each cruise the inertial torque is zero, so the
-torque moteus reports is friction(v) + conservative(theta) (gravity,
+torque the drives report is friction(v) + conservative(theta) (gravity,
 cogging, cable preload). Pairing the forward and backward passes over the
 same positions separates the two:
 
@@ -20,21 +20,22 @@ import math
 from dataclasses import asdict, dataclass
 
 import device_config
-from experiment_common import (Command, MoteusSession, Segment, confirm, describe_plan, hold,
+from experiment_common import (Command, WristSession, Segment, confirm, describe_plan, hold,
                                make_arg_parser, min_jerk_move, run_cli)
 
 EXPERIMENT = 'friction_sweep'
-SIM_PARAMS = None   # Tests can inject a moteus_sim.SimParams here.
+SIM_PARAMS = None   # Tests can inject a p4_sim.SimParams here.
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class SweepConfig:
     # Tracking must be stiffer than the cogging's peak stiffness (amplitude x
-    # 2 pi / period, about 240 N m/rad for the GL60 II at ~9.8:1); a softer loop
-    # snaps from detent to detent at slow speeds and inflates low-speed friction.
-    kp_joint_nm_rad: float = 600.0
-    kd_joint_nms_rad: float = 1.5
+    # 2 pi / period; ~14 N m/rad at FE for the simulated ILM50 motors); a softer
+    # loop snaps from detent to detent at slow speeds and inflates low-speed
+    # friction. The 500 Hz loop's delay caps stable stiffness near 80 N m/rad.
+    kp_joint_nm_rad: float = 80.0
+    kd_joint_nms_rad: float = 1.0
     speeds_deg_s: tuple = (0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0)
     window_deg: tuple = (-40.0, 40.0)    # Position range covered by each pass
     max_cruise_s: float = 15.0           # Caps the cruise length at slow speeds
@@ -68,8 +69,8 @@ def pass_geometry(cfg, speed):
 def constant_velocity_pass(start, end, speed, accel, info):
     """Blend up to speed, cruise, blend down, as velocity-only commands.
 
-    Position is sent as nan so moteus integrates the setpoint itself at its
-    control rate. Re-sending an absolute position every cycle would make the
+    Position is sent as nan so the p4wrist loop integrates the setpoint itself
+    at its control rate. Re-sending an absolute position every cycle would make the
     setpoint jump by speed x (latency jitter) on each command, which shows up
     as torque ripple correlated with the sample instants and biases the mean
     torque low at high speed. The dwell holds between passes re-anchor the
@@ -150,7 +151,7 @@ async def main(args):
     cfg = SweepConfig(**(QUICK if args.quick else {}))
     segments = build_segments(cfg)
     warnings = plan_warnings(cfg)
-    async with MoteusSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
+    async with WristSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
         confirm(args, ['Constant-velocity friction sweep (stiff PD + velocity feedforward)',

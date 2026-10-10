@@ -10,8 +10,11 @@ standard error across periods. From H:
   interpolation), the -90 deg phase crossing, and the resonance peak;
 * a parametric fit of the joint inertia J, viscous damping b, and an
   effective loop delay tau with the known PD gains:
-      H = e^{-s tau} (Kp + FF Kd s) / (J s^2 + b s + e^{-s tau} (Kp + Kd s)),
-  FF = 1 when the velocity feedforward was sent. The fitted model also gives
+      H = e^{-s tau} (Kp + FF Kd s) / (J s^2 + b s + e^{-s tau} (Kp + Kd D(s))),
+  FF = 1 when the velocity feedforward was sent. D(s) = s for a true velocity;
+  the p4wrist loop differences positions (half a period of lag) and filters
+  them, D(s) = s e^{-s T/2} / (1 + s/w_f), with tau starting at its 2-period
+  CST delay. The fitted model also gives
   an extrapolated bandwidth when -3 dB lies beyond the measured range.
 
 Levels whose controller torque sat at the torque cap for more than 1% of the
@@ -29,8 +32,9 @@ import pandas as pd
 from scipy import optimize
 
 import device_config
-from analysis_common import (export_figure, fit_sinusoids, load_run, make_parser, print_header,
-                             print_truth_comparison, save_outputs, saturation_fraction, sim_truth)
+from analysis_common import (export_figure, fit_sinusoids, load_run, loop_timing, make_parser,
+                             print_header, print_truth_comparison, save_outputs,
+                             saturation_fraction, sim_truth)
 from ieee_plot import (INK, SERIES, add_panel_label, configure_ieee_style, direct_label,
                        figure_size, log_ticks_hz, ordinal_colors, reference_line, style_axis,
                        zero_line)
@@ -139,35 +143,63 @@ def response_metrics(freqs, H, valid):
 
 
 # --- parametric model -------------------------------------------------------------
-def model_response(freqs, J, b, tau, kp, kd, ff):
+def model_response(freqs, J, b, tau, kp, kd, ff, vel=None):
+    """Closed-loop H. vel describes a velocity estimated from positions: the
+    p4wrist loop differences them (half a period of lag) and filters them
+    (first order, vel['filter_hz']); None means the true velocity."""
     s = 2j * np.pi * np.asarray(freqs, dtype=float)
     delay = np.exp(-s * tau)
-    return delay * (kp + ff * kd * s) / (J * s ** 2 + b * s + delay * (kp + kd * s))
+    D = s
+    if vel:
+        D = s * np.exp(-s * vel['lag_s']) / (1.0 + s / (2.0 * np.pi * vel['filter_hz']))
+    return delay * (kp + ff * kd * s) / (J * s ** 2 + b * s + delay * (kp + kd * D))
 
 
-def fit_model(freqs, H, se, kp, kd, ff):
-    """Weighted complex least squares for J, b and the loop delay."""
+def velocity_path(run):
+    """The p4wrist loop's velocity estimate, for model_response, or None."""
+    loop = loop_timing(run)
+    if loop is None or not run.meta.get('velocity_filter_hz'):
+        return None
+    return {'lag_s': loop['period_s'] / 2.0, 'filter_hz': float(run.meta['velocity_filter_hz'])}
+
+
+def fit_model(freqs, H, se, kp, kd, ff, vel=None, tau0=5e-4, tau_fixed=None):
+    """Weighted complex least squares for J, b and the loop delay.
+
+    J, b and the delay trade off against each other over a band this narrow;
+    when the loop delay is known (p4wrist: 2 SYNC periods) pass tau_fixed and
+    only J and b are fitted."""
     sigma = np.where(np.isfinite(se), se, 0.0)
     sigma = np.sqrt(sigma ** 2 + (0.01 * np.abs(H)) ** 2)
 
+    def unpack(x):
+        return math.exp(x[0]), x[1], (tau_fixed if tau_fixed is not None else x[2])
+
     def residual(x):
-        err = (model_response(freqs, math.exp(x[0]), x[1], x[2], kp, kd, ff) - H) / sigma
+        J, b, tau = unpack(x)
+        err = (model_response(freqs, J, b, tau, kp, kd, ff, vel) - H) / sigma
         return np.concatenate([err.real, err.imag])
 
     x0 = [math.log(device_config.NOMINAL_JOINT_INERTIA_KG_M2),
-          device_config.NOMINAL_JOINT_DAMPING_NMS_RAD, 5e-4]
-    result = optimize.least_squares(residual, x0, bounds=([math.log(1e-5), -2.0, 0.0],
-                                                          [math.log(10.0), 20.0, 0.02]))
-    J, b, tau = math.exp(result.x[0]), float(result.x[1]), float(result.x[2])
-    fitted = model_response(freqs, J, b, tau, kp, kd, ff)
+          device_config.NOMINAL_JOINT_DAMPING_NMS_RAD]
+    lower, upper = [math.log(1e-5), -2.0], [math.log(10.0), 20.0]
+    if tau_fixed is None:
+        x0.append(tau0)
+        lower.append(0.0)
+        upper.append(0.02)
+    result = optimize.least_squares(residual, x0, bounds=(lower, upper))
+    J, b, tau = unpack(result.x)
+    J, b, tau = float(J), float(b), float(tau)
+    fitted = model_response(freqs, J, b, tau, kp, kd, ff, vel)
     err_db = 20.0 * np.log10(np.abs(H) / np.abs(fitted))
     dense = np.logspace(-2, 3, 4000)
-    model = model_response(dense, J, b, tau, kp, kd, ff)
+    model = model_response(dense, J, b, tau, kp, kd, ff, vel)
     rel = 20.0 * np.log10(np.abs(model) / np.abs(model[0]))
     return {
         'fit_J_kg_m2': J,
         'fit_b_nms_rad': b,
         'fit_delay_ms': 1000.0 * tau,
+        'fit_delay_fixed': tau_fixed is not None,
         'fit_bandwidth_hz': crossing(dense, rel, -3.0),
         'fit_phase_90_hz': crossing(dense, phase_deg(model), -90.0),
         'fit_rms_error_db': float(np.sqrt(np.mean(err_db ** 2))),
@@ -177,7 +209,7 @@ def fit_model(freqs, H, se, kp, kd, ff):
 
 
 # --- figures -------------------------------------------------------------------------
-def plot_bode(levels, fit, kp, kd, ff, headline, f_range, f_measured_max):
+def plot_bode(levels, fit, kp, kd, ff, headline, f_range, f_measured_max, vel=None):
     fig, (ax_m, ax_p) = plt.subplots(2, 1, sharex=True, figsize=figure_size('single', 3.6),
                                      gridspec_kw={'hspace': 0.12})
     shown = [lv for lv in levels if lv['valid']]
@@ -206,7 +238,7 @@ def plot_bode(levels, fit, kp, kd, ff, headline, f_range, f_measured_max):
     dense = np.logspace(math.log10(first), math.log10(f_measured_max), 400)
     if fit:
         model = model_response(dense, fit['fit_J_kg_m2'], fit['fit_b_nms_rad'],
-                               fit['fit_delay_ms'] / 1000.0, kp, kd, ff)
+                               fit['fit_delay_ms'] / 1000.0, kp, kd, ff, vel)
         ax_m.plot(dense, 20 * np.log10(np.abs(model)), color=INK, linestyle='--',
                   linewidth=0.9, label='Fitted model', zorder=3)
         ax_p.plot(dense, phase_deg(model), color=INK, linestyle='--', linewidth=0.9, zorder=3)
@@ -377,7 +409,16 @@ def main(argv=None):
     f_fit = np.concatenate([lv['freqs'][lv['line_valid']] for lv in valid_levels])
     H_fit = np.concatenate([lv['H'][lv['line_valid']] for lv in valid_levels])
     se_fit = np.concatenate([lv['se'][lv['line_valid']] for lv in valid_levels])
-    fit = fit_model(f_fit, H_fit, se_fit, kp, kd, ff)
+    vel = velocity_path(run)
+    loop = loop_timing(run)
+    if loop:
+        # The loop delay is known; a free delay is fitted too, as a check.
+        fit = fit_model(f_fit, H_fit, se_fit, kp, kd, ff, vel, tau_fixed=loop['delay_s'])
+        free = fit_model(f_fit, H_fit, se_fit, kp, kd, ff, vel, tau0=loop['delay_s'])
+        fit.update({f'free_delay_{k}': v for k, v in free.items()
+                    if k in ('fit_J_kg_m2', 'fit_b_nms_rad', 'fit_delay_ms', 'fit_rms_error_db')})
+    else:
+        fit = fit_model(f_fit, H_fit, se_fit, kp, kd, ff)
     times = df['time'].to_numpy()
     sample_rate = float(1.0 / np.median(np.diff(times))) if len(times) > 1 else math.nan
 
@@ -450,13 +491,14 @@ def main(argv=None):
         print_truth_comparison([('Inertia J (FRF fit)', fit['fit_J_kg_m2'], J_true, 'kg m^2')])
         print(f"  Effective b {fit['fit_b_nms_rad']:.3g} N m s/rad is not comparable to the "
               f"viscous truth {b_true:.3g}: Kd and friction dominate the loop damping.")
-        true_H = model_response(f_fit, J_true, b_true, 0.0, kp, kd, ff)
+        tau_true = (loop['delay_s'] + truth['current_loop_time_constant']) if loop else 0.0
+        true_H = model_response(f_fit, J_true, b_true, tau_true, kp, kd, ff, vel)
         dev = 20 * np.log10(np.abs(H_fit) / np.abs(true_H))
         print(f'  Measured vs true rigid model: max |error| {np.max(np.abs(dev)):.2f} dB')
         summary['sim_max_error_vs_true_model_db'] = float(np.max(np.abs(dev)))
 
     f_range = (freqs[0] * 0.8, freqs[-1] * 1.25)
-    fig = plot_bode(levels, fit, kp, kd, ff, headline, f_range, float(freqs[-1]))
+    fig = plot_bode(levels, fit, kp, kd, ff, headline, f_range, float(freqs[-1]), vel)
     paths = export_figure(fig, run, BODE_BASENAME, {**metadata, **summary}, args.paper_dir)
     if not legacy:
         fig_t = plot_time(headline_level['frame'], period, headline_level['amplitude_deg'])

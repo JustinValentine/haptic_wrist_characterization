@@ -1,4 +1,4 @@
-"""Cogging on the simulated GL60 II: the friction sweep identifies it, and the
+"""Cogging on the simulated wrist: the friction sweep identifies it, and the
 analyses that hold the motor within a few cogging periods subtract its model."""
 import json
 import unittest
@@ -29,22 +29,23 @@ class CoggingPipelineTest(unittest.TestCase):
                 runs[name] = run_analysis(analysis, run_dir)
 
         self.assertTrue(sweep['cogging_detected'])
-        self.assertLess(rel_err(sweep['cogging_amplitude_nm'], truth['cogging_amplitude']), 0.10)
+        # Read low through the loop's finite stiffness (see test_friction_sweep).
+        self.assertLess(rel_err(sweep['cogging_amplitude_nm'], truth['cogging_amplitude']), 0.30)
 
         # Breakaway torque = static friction + cogging at the stuck position: the model
         # collapses the spread the cogging puts into individual breakaways.
         ramp = runs['ramp']
         self.assertTrue(ramp['cogging_removed'])
         self.assertLess(rel_err(ramp['static_friction_nm'], truth['static']), 0.10)
-        self.assertGreater(ramp['breakaway_torque_std_nm'], 5.0 * ramp['static_friction_std_nm'])
+        # (This wrist's cogging is small next to its friction, so the spread it adds is too.)
+        self.assertGreater(ramp['breakaway_torque_std_nm'], 1.5 * ramp['static_friction_std_nm'])
 
-        # Cogging's local stiffness would otherwise add to the cable's.
+        # Cogging's local stiffness would otherwise add to the cable's. The P4's
+        # 4096-count encoders resolve the cable's ~0.06 deg deflection in ~5 counts.
         transmission = runs['transmission']
         self.assertTrue(transmission['cogging_removed'])
         self.assertLess(rel_err(transmission['stiffness_nm_rad'],
-                                truth['transmission_stiffness']), 0.03)
-        self.assertLess(rel_err(transmission['dynamic_stiffness_nm_rad'],
-                                truth['transmission_stiffness']), 0.05)
+                                truth['transmission_stiffness']), 0.10)
 
         calibration = runs['calibration']
         self.assertTrue(calibration['cogging_removed'])

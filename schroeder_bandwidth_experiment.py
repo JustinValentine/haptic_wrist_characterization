@@ -19,18 +19,18 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 import device_config
-from experiment_common import (Command, MoteusSession, Segment, confirm, describe_plan, hold,
+from experiment_common import (Command, WristSession, Segment, confirm, describe_plan, hold,
                                make_arg_parser, run_cli)
 
 EXPERIMENT = 'bandwidth'
-SIM_PARAMS = None   # Tests may inject a moteus_sim.SimParams
+SIM_PARAMS = None   # Tests may inject a p4_sim.SimParams
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class BandwidthConfig:
-    kp_joint_nm_rad: float = 450.0          # Stiff PD (nominal operating gains)
-    kd_joint_nms_rad: float = 0.75
+    kp_joint_nm_rad: float = 80.0           # Stiff PD (nominal operating gains)
+    kd_joint_nms_rad: float = 1.0 
     send_velocity_feedforward: bool = True  # Changes the closed-loop transfer function
     amplitudes_deg: tuple = (2.0, 5.0, 10.0)   # Peak command per level
     period_s: float = 10.0                  # Frequency resolution is 1 / period
@@ -43,7 +43,7 @@ class BandwidthConfig:
     torque_budget_fraction: float = 0.5     # Predicted peak torque / torque cap
     crest_iterations: int = 40              # Clipping iterations to lower the crest factor
     rest_s: float = 1.0                     # Hold at zero between levels
-    sample_rate_hz: float = 1000.0
+    sample_rate_hz: float = 500.0
 
 
 QUICK = dict(amplitudes_deg=(3.0, 10.0), period_s=5.0, periods_per_level=3,
@@ -224,7 +224,7 @@ async def main(args):
     design = design_multisine(cfg, device_config.MAX_JOINT_TORQUE_NM)
     segments = build_segments(cfg, design)
     lines = plan_lines(cfg, design)
-    async with MoteusSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
+    async with WristSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
         confirm(args, ['Closed-loop position bandwidth (periodic multisine)',

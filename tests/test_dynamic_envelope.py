@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from tests.helpers import rel_err, run_analysis, run_sim_experiment, scratch_dir
+from tests.helpers import frictionless, rel_err, run_analysis, run_sim_experiment, scratch_dir
 
 import dynamic_envelope_experiment as experiment
 import dynamic_envelope_experiment_analysis as analysis
@@ -13,15 +13,22 @@ import dynamic_envelope_experiment_analysis as analysis
 
 class DynamicEnvelopeTest(unittest.TestCase):
     def test_envelope_follows_torque_limit_at_high_frequency(self):
-        with scratch_dir() as tmp:
-            run_dir = run_sim_experiment(experiment, tmp / 'run')
-            meta = json.loads((run_dir / 'dynamic_envelope_metadata.json').read_text())
-            self.assertTrue(meta['completed'])
-            self.assertIsNone(meta['abort_reason'])
-            truth = meta['sim_truth']
-            summary = run_analysis(analysis, run_dir)
-            envelope = pd.read_csv(run_dir / 'analysis' / 'envelope.csv')
-            trials = pd.read_csv(run_dir / 'analysis' / 'trials.csv')
+        # Without Coulomb friction the small-signal reference is linear, so the
+        # high-frequency limit is the actuator's (with friction on this wrist the
+        # reference gain itself depends on amplitude).
+        experiment.SIM_PARAMS = frictionless()
+        try:
+            with scratch_dir() as tmp:
+                run_dir = run_sim_experiment(experiment, tmp / 'run')
+                meta = json.loads((run_dir / 'dynamic_envelope_metadata.json').read_text())
+                self.assertTrue(meta['completed'])
+                self.assertIsNone(meta['abort_reason'])
+                truth = meta['sim_truth']
+                summary = run_analysis(analysis, run_dir)
+                envelope = pd.read_csv(run_dir / 'analysis' / 'envelope.csv')
+                trials = pd.read_csv(run_dir / 'analysis' / 'trials.csv')
+        finally:
+            experiment.SIM_PARAMS = None
 
         # Every trial is classified, online and offline agree.
         self.assertTrue(trials['reason'].notna().all())

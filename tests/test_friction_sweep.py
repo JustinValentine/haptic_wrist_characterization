@@ -23,9 +23,13 @@ class FrictionSweepTest(unittest.TestCase):
         self.assertGreater(summary['fit_r2'], 0.95)
         # No gravity in the default plant: the conservative torque is ~zero.
         self.assertLess(abs(summary['conservative_offset_nm']), 0.005)
-        # The slowest pass resolves the GL60 II's cogging: 168 cycles per motor revolution.
+        # The slowest pass resolves the motors' cogging (60 cycles per motor turn in
+        # the simulator). The loop can only be ~80 N m/rad stiff against cogging
+        # that is itself ~14 N m/rad stiff at FE, so part of the ripple becomes
+        # position ripple instead of torque: the amplitude reads ~20% low.
         self.assertTrue(summary['cogging_detected'])
-        self.assertLess(rel_err(summary['cogging_amplitude_nm'], truth['cogging_amplitude']), 0.10)
+        self.assertLess(rel_err(summary['cogging_amplitude_nm'], truth['cogging_amplitude']), 0.30)
+        self.assertLess(summary['cogging_amplitude_nm'], truth['cogging_amplitude'])
         self.assertLess(rel_err(summary['cogging_period_deg'], truth['cogging_period_deg']), 0.01)
         self.assertAlmostEqual(summary['cogging_cycles_per_motor_rev'],
                                truth['cogging_periods_per_motor_rev'], delta=0.5)

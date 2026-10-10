@@ -16,7 +16,7 @@ import math
 from dataclasses import asdict, dataclass
 
 import device_config
-from experiment_common import (MoteusSession, confirm, describe_plan, hold, make_arg_parser,
+from experiment_common import (WristSession, confirm, describe_plan, hold, make_arg_parser,
                                min_jerk_move, run_cli)
 
 EXPERIMENT = 'step_response'
@@ -25,21 +25,25 @@ EXPERIMENT = 'step_response'
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class StepConfig:
-    kp_joint_nm_rad: float = 15.0           # Soft P-only spring (Kd = 0)
+    kp_joint_nm_rad: float = 5.0            # Soft spring
+    # Small known damping. The loop applies torque 2 SYNC periods (4 ms) after the
+    # position it came from, which acts like -Kp x 4 ms of damping and would leave a
+    # P-only ring-down barely decaying. The analysis removes both Kd and the delay.
+    kd_joint_nms_rad: float = 0.04
     step_sizes_deg: tuple = (5.0, 10.0, 20.0)
     steps_per_size: int = 6                 # Alternating up/down steps per size
     center_deg: float = 0.0                 # Steps are centered here
     hold_s: float = 3.0                     # Per step; must cover the full ring-down
     settle_s: float = 2.0                   # Before each block of steps
     reposition_speed_deg_s: float = 20.0
-    sample_rate_hz: float = 1000.0
+    sample_rate_hz: float = 500.0
 
 
 QUICK = dict(step_sizes_deg=(10.0, 20.0), steps_per_size=4, hold_s=2.0, settle_s=1.0)
 
 
 def build_segments(cfg):
-    p_only = dict(kd_scale=0.0)
+    p_only = {}   # Kp and the small Kd of the config
     segments = [hold(cfg.settle_s, 0.0, phase='settle', **p_only)]
     position = 0.0
     step_id = 0
@@ -88,7 +92,7 @@ async def main(args):
     cfg = StepConfig(**(QUICK if args.quick else {}))
     segments = build_segments(cfg)
     warnings = plan_warnings(cfg)
-    async with MoteusSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, 0.0,
+    async with WristSession(EXPERIMENT, args, cfg.kp_joint_nm_rad, cfg.kd_joint_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz) as session:
         confirm(args, ['Step-response identification (P-only, Kd = 0)',
                        f'  Kp = {cfg.kp_joint_nm_rad} N m/rad, steps {cfg.step_sizes_deg} deg '

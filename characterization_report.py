@@ -8,7 +8,7 @@ newest real run by default) and writes
     report/characterization_table.md      the same table in Markdown
 
 Torque-derived quantities (inertia, damping, friction, stiffness, torque) are
-in the torque scale moteus reports. If a torque calibration run exists, its
+in the torque scale the drives report. If a torque calibration run exists, its
 scale factor (actual / commanded torque) is applied in a separate
 "calibrated" column, so both are visible. The report also cross-checks
 quantities that several experiments measure independently.
@@ -182,8 +182,8 @@ def ci_bounds(summary, m):
 
 
 def mode_label(mode):
-    if mode == 'moteus':
-        return 'firmware loop'
+    if mode == 'rt':
+        return '500 Hz loop'
     match = re.fullmatch(r'host_(\d+(?:\.\d+)?)', mode)
     if match:
         rate = float(match.group(1))
@@ -367,7 +367,7 @@ def cross_check_lines(summaries, k_torque):
                              f'{imp[key]:.3g}, pulse Z-width {zw:.3g} (friction quenches small '
                              'oscillations, so the pulse test reads higher)')
     if lines and k_torque:
-        lines.append(f'  (transparency values are sensor-measured; the others are in moteus torque '
+        lines.append(f'  (transparency values are sensor-measured; the others are in the drive torque '
                      f'scale: multiply them by {k_torque:.3f} before comparing)')
     return lines
 

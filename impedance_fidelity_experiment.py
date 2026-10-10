@@ -1,9 +1,9 @@
 """Rendered impedance spectrum: the stiffness and damping the wrist actually displays.
 
 A target spring-damper Z_d = K + B s is rendered about a fixed pose, either by
-the moteus position loop ('moteus' mode, the firmware loop) or by this host
-from the previous measurement ('host_<rate>' modes, a PC-side haptic loop with
-one sample of delay plus communication latency). A periodic torque multisine
+the p4wrist 500 Hz loop ('rt' mode: torque 2 SYNC periods after its sample)
+or by this host from the previous measurement ('host_<rate>' modes, a PC-side
+haptic loop, which adds its own period and sample age to that delay). A periodic torque multisine
 is added on top. The measured compliance C = Theta / T_d gives the displayed
 impedance
 
@@ -29,34 +29,34 @@ from types import SimpleNamespace
 import numpy as np
 
 import device_config
-from experiment_common import (Command, MoteusSession, Segment, confirm, hold, latest_summary,
+from experiment_common import (Command, WristSession, Segment, confirm, hold, latest_summary,
                                make_arg_parser, min_jerk_move, run_cli)
 from schroeder_bandwidth_experiment import (Multisine, excited_bins, reduce_crest_factor,
                                             schroeder_phases, synthesize)
 from zwidth_experiment import classify_trial, make_stop_check, noise_floor
 
 EXPERIMENT = 'impedance'
-SIM_PARAMS = None   # Tests may inject a moteus_sim.SimParams
+SIM_PARAMS = None   # Tests may inject a p4_sim.SimParams
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class ImpedanceConfig:
-    # (mode, K N m/rad, B N m s/rad). 'moteus' or 'host_<rate_hz>'. The first
+    # (mode, K N m/rad, B N m s/rad). 'rt' or 'host_<rate_hz>'. The first
     # near-free target (small K, B = 0) measures the intrinsic device impedance;
     # a matched (K, B) in both loops compares firmware and host rendering.
-    targets: tuple = (('moteus', 5.0, 0.0),
-                      ('moteus', 40.0, 0.2),
-                      ('moteus', 200.0, 0.2),
-                      ('host_1000', 10.0, 0.0),
-                      ('host_1000', 40.0, 0.2),
-                      ('host_1000', 100.0, 0.3))   # Stiffest: a damping error dB biases the
+    targets: tuple = (('rt', 5.0, 0.0),
+                      ('rt', 20.0, 0.2),
+                      ('rt', 60.0, 0.5),
+                      ('host_250', 5.0, 0.0),
+                      ('host_250', 20.0, 0.2),
+                      ('host_250', 30.0, 0.3))    # Stiffest: a damping error dB biases the
                                                     # delay by dB / K
     center_deg: float = 0.0
     period_s: float = 4.0                  # Frequency resolution = 1 / period
     periods: int = 5                       # The first is discarded (transient)
     freq_min_hz: float = 0.5
-    freq_max_hz: float = 40.0              # Keep below the transmission resonance
+    freq_max_hz: float = 20.0              # Below rate/10 of the slowest host loop (250 Hz)
     num_lines: int = 30
     line_displacement_deg: float = 0.25    # Target motion per line (displacement-flat design)
     max_motion_deg: float = 4.0            # Predicted peak motion of the whole multisine
@@ -65,7 +65,7 @@ class ImpedanceConfig:
     torque_cap_fraction: float = 0.6       # Of the device torque cap, during targets
     min_center_k_nm_rad: float = 2.0       # Below this the joint drifts; not allowed
     zwidth_margin: float = 0.7             # Skip targets above this x measured Z-width K_max
-    safe_k_nm_rad: float = 20.0            # Hold between targets (moteus PD)
+    safe_k_nm_rad: float = 20.0            # Hold between targets (loop PD)
     safe_b_nms_rad: float = 0.3
     settle_s: float = 0.4
     precheck_pulse_nm: float = 1.0         # Stability pre-check: torque pulse ...
@@ -75,11 +75,11 @@ class ImpedanceConfig:
     max_deviation_deg: float = 10.0        # Stop a target beyond this
     max_velocity_deg_s: float = 600.0
     return_speed_deg_s: float = 30.0
-    sample_rate_hz: float = 1000.0
+    sample_rate_hz: float = 500.0
 
 
-QUICK = dict(targets=(('moteus', 5.0, 0.0), ('moteus', 40.0, 0.2),
-                      ('host_1000', 10.0, 0.0), ('host_1000', 40.0, 0.2)),
+QUICK = dict(targets=(('rt', 5.0, 0.0), ('rt', 20.0, 0.2),
+                      ('host_250', 5.0, 0.0), ('host_250', 20.0, 0.2)),
              period_s=2.0, periods=3, freq_min_hz=1.0, num_lines=20)
 
 PRECHECK_START_S = 0.2   # Target active this long before the pulse
@@ -88,16 +88,16 @@ PRECHECK_START_S = 0.2   # Target active this long before the pulse
 def parse_target(index, target, cfg):
     mode, K, B = target
     K, B = float(K), float(B)
-    if mode == 'moteus':
-        renderer, rate = 'moteus', cfg.sample_rate_hz
+    if mode == 'rt':
+        renderer, rate = 'rt', cfg.sample_rate_hz
     elif isinstance(mode, str) and mode.startswith('host_'):
         try:
             rate = float(mode.split('_', 1)[1])
         except ValueError:
-            raise SystemExit(f'Bad mode {mode!r}; use host_<rate_hz>, e.g. host_1000.')
+            raise SystemExit(f'Bad mode {mode!r}; use host_<rate_hz>, e.g. host_250.')
         renderer = 'host'
     else:
-        raise SystemExit(f'Unknown mode {mode!r}; use "moteus" or "host_<rate_hz>".')
+        raise SystemExit(f'Unknown mode {mode!r}; use "rt" or "host_<rate_hz>".')
     return {'target_id': index, 'mode': mode, 'renderer': renderer, 'rate_hz': rate,
             'k_nm_rad': K, 'b_nms_rad': B}
 
@@ -169,7 +169,7 @@ def render_command(target, theta0, cap, tau_d=None, pulse=None):
             return pulse[2]
         return 0.0
 
-    if target['renderer'] == 'moteus':
+    if target['renderer'] == 'rt':
         def command(t, _):
             return Command(position_deg=theta0, torque_nm=extra(t), max_torque_nm=cap)
     else:
@@ -195,7 +195,7 @@ async def contain(session, cfg, target, theta0):
     """Brake, restore the safe hold, and return to the center pose."""
     info = {'target_id': target['target_id']}
     await session.brake(cfg.brake_s, info=info)
-    if target['renderer'] == 'moteus':
+    if target['renderer'] == 'rt':
         await session.set_gains(cfg.safe_k_nm_rad, cfg.safe_b_nms_rad)
     here = await session.command(Command(position_deg=math.nan))
     await session.run_segment(min_jerk_move(here['joint_pos_deg'], theta0,
@@ -204,7 +204,7 @@ async def contain(session, cfg, target, theta0):
 
 async def run_target(session, cfg, target, theta0, cap):
     # Segment info is merged into logged rows: never use logged column names
-    # such as 'mode' (the moteus mode register) here.
+    # such as 'mode' (the logged mode column) here.
     info = {'target_id': target['target_id'], 'render_mode': target['mode'],
             'virtual_k_nm_rad': target['k_nm_rad'], 'virtual_b_nms_rad': target['b_nms_rad'],
             'render_rate_hz': target['rate_hz']}
@@ -212,7 +212,7 @@ async def run_target(session, cfg, target, theta0, cap):
     noise_deg, noise_nm = noise_floor([r['t_local'] for r in settle.rows],
                                       [r['joint_pos_deg'] - theta0 for r in settle.rows],
                                       [r['joint_torque_nm'] for r in settle.rows])
-    if target['renderer'] == 'moteus':
+    if target['renderer'] == 'rt':
         await session.set_gains(target['k_nm_rad'], target['b_nms_rad'])
 
     pulse_end = PRECHECK_START_S + cfg.precheck_pulse_s
@@ -318,7 +318,7 @@ async def main(args):
     per_target = (cfg.settle_s + PRECHECK_START_S + cfg.precheck_pulse_s + cfg.precheck_observe_s
                   + cfg.period_s * cfg.periods + cfg.brake_s + 0.5)
     theta0 = cfg.center_deg
-    async with MoteusSession(EXPERIMENT, args, cfg.safe_k_nm_rad, cfg.safe_b_nms_rad,
+    async with WristSession(EXPERIMENT, args, cfg.safe_k_nm_rad, cfg.safe_b_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
         lines = ['Rendered impedance spectrum (target impedance + torque multisine)',

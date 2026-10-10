@@ -21,11 +21,11 @@ import math
 from dataclasses import asdict, dataclass
 
 import device_config
-from experiment_common import (Command, MoteusSession, SafetyLimits, Segment, confirm, hold,
+from experiment_common import (Command, WristSession, SafetyLimits, Segment, confirm, hold,
                                latest_summary, make_arg_parser, run_cli)
 
 EXPERIMENT = 'transparency'
-SIM_PARAMS = None   # Tests inject a moteus_sim.SimParams here.
+SIM_PARAMS = None   # Tests inject a p4_sim.SimParams here.
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
@@ -39,10 +39,10 @@ class TransparencyConfig:
     compensation_cap_nm: float = 0.5      # Never add more than this
     coulomb_smoothing_deg_s: float = 5.0  # tanh width of the Coulomb term
     max_torque_nm: float = 1.0            # Session torque cap
-    max_velocity_deg_s: float = 1000.0    # Abort above this speed
+    max_velocity_deg_s: float = 700.0     # Abort above this speed
     countdown_s: float = 3.0              # Pause between phases with --yes
     rest_s: float = 1.0                   # Zero torque before each trial
-    sample_rate_hz: float = 1000.0
+    sample_rate_hz: float = 500.0
     sim_human_stiffness: float = 40.0     # Simulated operator (N m/rad)
     sim_human_damping: float = 0.8        # Simulated operator (N m s/rad)
 
@@ -162,8 +162,8 @@ async def announce(session, args, cfg, condition, speed, freq_hz):
     if session.is_sim:
         plant = session.plant
         if plant.human is None:
-            import moteus_sim
-            plant.human = moteus_sim.HumanModel(motion=lambda t: (0.0, 0.0),
+            import p4_sim
+            plant.human = p4_sim.HumanModel(motion=lambda t: (0.0, 0.0),
                                                 stiffness=cfg.sim_human_stiffness,
                                                 damping=cfg.sim_human_damping)
         plant.human.motion = lambda t: (0.0, 0.0)
@@ -177,7 +177,7 @@ async def announce(session, args, cfg, condition, speed, freq_hz):
         await session.run_segment(hold(cfg.countdown_s, phase='wait', info=info,
                                        kp_scale=0.0, kd_scale=0.0))
         return
-    # Keep commanding zero torque while waiting so the moteus watchdog stays fed.
+    # Keep commanding zero torque while waiting so the loop's watchdog stays fed.
     await session.prompt_while_holding(message + 'Press Enter to start... ', ZERO,
                                        phase='wait', info=info)
 
@@ -188,7 +188,7 @@ async def main(args):
     estimates = friction_estimates(args.sim)
     limits = SafetyLimits(max_joint_velocity_deg_s=cfg.max_velocity_deg_s)
     trials = [(c, s, f) for c in cfg.conditions for s, f in cfg.speeds]
-    async with MoteusSession(EXPERIMENT, args, 0.0, 0.0, config=asdict(cfg),
+    async with WristSession(EXPERIMENT, args, 0.0, 0.0, config=asdict(cfg),
                              rate_hz=cfg.sample_rate_hz, needs_sensor=True,
                              sim_params=SIM_PARAMS, limits=limits,
                              max_torque_nm=cfg.max_torque_nm) as session:

@@ -144,6 +144,68 @@ def save_outputs(run, tables=None, summary=None, metadata=None, prefix=''):
     return paths
 
 
+def loop_delays(run):
+    """Delays of the p4wrist loop's PD terms (s): {'position': ..., 'velocity': ...}.
+
+    The position term reaches the motor 2 SYNC periods after its sample (the CST
+    ramp); the velocity term also waits half a period (differencing) and the
+    first-order velocity filter. Zero for runs without these fields (moteus).
+    """
+    delay = float(run.meta.get('loop_delay_s') or 0.0)
+    if not delay:
+        return {'position': 0.0, 'velocity': 0.0}
+    period = float((run.meta.get('p4wrist_config') or {}).get('period_s', delay / 2.0))
+    fv = run.meta.get('velocity_filter_hz')
+    filt = 1.0 / (2.0 * math.pi * float(fv)) if fv else 0.0
+    return {'position': delay, 'velocity': delay + period / 2.0 + filt}
+
+
+def loop_timing(run):
+    """{'delay_s', 'period_s'} of the p4wrist loop that produced the run, else None."""
+    if not run.meta.get('loop_delay_s'):
+        return None
+    return {'delay_s': float(run.meta['loop_delay_s']),
+            'period_s': float((run.meta.get('p4wrist_config') or {}).get(
+                'period_s', run.meta['loop_delay_s'] / 2.0))}
+
+
+def pwl_fourier(t, y, freqs, t_start, t_end):
+    """Fourier coefficients (2/(t_end - t_start)) * integral of y(t) exp(-j w t) over
+    [t_start, t_end] for y piecewise linear through the points (t, y): exact for a
+    P4's applied torque, which ramps to each cycle's target over a SYNC period."""
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+    inside = (t > t_start) & (t < t_end)
+    tt = np.concatenate([[t_start], t[inside], [t_end]])
+    yy = np.concatenate([[np.interp(t_start, t, y)], y[inside], [np.interp(t_end, t, y)]])
+    a, b = tt[:-1], tt[1:]
+    ya, yb = yy[:-1], yy[1:]
+    h = b - a
+    keep = h > 0
+    a, b, ya, yb, h = a[keep], b[keep], ya[keep], yb[keep], h[keep]
+    jw = 1j * 2.0 * np.pi * np.asarray(freqs, dtype=float)
+    Ea = np.exp(-np.outer(a, jw))
+    Eb = np.exp(-np.outer(b, jw))
+    total = ((ya[:, None] * Ea - yb[:, None] * Eb) / jw
+             + ((yb - ya) / h)[:, None] * (Ea - Eb) / jw ** 2)
+    return (2.0 / (t_end - t_start)) * total.sum(axis=0)
+
+
+def applied_torque_times(time, loop):
+    """When each loop cycle's torque target is fully applied: the CST ramp ends
+    loop_delay after the cycle (2 SYNC periods), in the cycle's own time base."""
+    return np.asarray(time, dtype=float) + loop['delay_s']
+
+
+def correct_for_loop(J_app, b_app, kp, kd, delays):
+    """Plant J and b from those seen through a delayed PD loop.
+
+    (kp + kd s) with delays Tp, Td adds, to second order in s,
+    -kd Td + kp Tp^2/2 to the apparent inertia and kd - kp Tp to the damping."""
+    Tp, Td = delays['position'], delays['velocity']
+    return J_app + kd * Td - kp * Tp ** 2 / 2.0, b_app - kd + kp * Tp
+
+
 # --- signal processing ------------------------------------------------------------
 def uniform_grid(t, fs=None):
     t = np.asarray(t, dtype=float)

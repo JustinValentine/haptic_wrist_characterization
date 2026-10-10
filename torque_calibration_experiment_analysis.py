@@ -1,13 +1,13 @@
 """Fit measured output torque against commanded torque (locked output).
 
 For every held level the analysis averages the external sensor (or takes the
-typed reading) and the moteus-reported torque, then fits
+typed reading) and the drive-reported torque, then fits
 
     measured = k * commanded + offset
 
 over both approach directions. k is the torque scale factor (actual /
 commanded): multiply J, b, fc, and stiffness values identified from
-moteus-reported torque by k. It combines torque-constant error and static
+drive-reported torque by k. It combines torque-constant error and static
 transmission efficiency. Nonlinearity is the largest fit residual as a
 percentage of full scale; hysteresis is the difference between levels
 approached from below (up branch) and from above (down branch), which with a
@@ -194,7 +194,7 @@ def plot_timeseries(df):
     if 'ext_torque_nm' in data and data['ext_torque_nm'].notna().any():
         ax_t.plot(t, data['ext_torque_nm'], color=SERIES[0], linewidth=0.6, label='External sensor')
     ax_t.plot(t, data['joint_torque_nm'], color=SERIES[1], linewidth=0.6, linestyle='--',
-              label='moteus reported')
+              label='drive reported')
     measure = data['phase'] == 'measure'
     ax_t.plot(t[measure], data['cmd_ff_torque_nm'][measure], linestyle='None', marker='.',
               markersize=1.0, color=MUTED, label='Averaging windows')
@@ -253,7 +253,7 @@ def main(argv=None):
           f"{summary['hysteresis_mean_nm']:.4f} N m "
           f"({summary['hysteresis_max_percent_fs']:.2f} % FS)")
     print(f"  Hysteresis at zero        {summary['hysteresis_at_zero_nm']:.4f} N m")
-    print(f"  moteus reported / commanded {summary['reported_vs_commanded_scale']:.4f}")
+    print(f"  drive reported / commanded {summary['reported_vs_commanded_scale']:.4f}")
     print(f"  Reading at start (0 N m)  {summary['measured_at_start_nm']:+.4f} N m")
     if summary['torque_scale_factor'] < 0:
         print('WARNING: negative scale factor; the sensor sign is probably flipped '

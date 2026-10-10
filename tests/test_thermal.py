@@ -4,7 +4,7 @@ import unittest
 
 from tests.helpers import rel_err, run_analysis, run_sim_experiment, scratch_dir
 
-import moteus_sim
+import p4_sim
 import thermal_experiment
 import thermal_experiment_analysis
 
@@ -12,7 +12,7 @@ import thermal_experiment_analysis
 class ThermalTest(unittest.TestCase):
     def test_recovers_thermal_model_and_continuous_torque(self):
         # A fast thermal plant so the quick protocol reaches steady state.
-        thermal_experiment.SIM_PARAMS = moteus_sim.SimParams(thermal_time_constant=15.0)
+        thermal_experiment.SIM_PARAMS = p4_sim.SimParams(thermal_time_constant=15.0)
         try:
             with scratch_dir() as tmp:
                 run_dir = run_sim_experiment(thermal_experiment, tmp / 'run')

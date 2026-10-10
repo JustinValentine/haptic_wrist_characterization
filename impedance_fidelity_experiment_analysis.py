@@ -8,11 +8,12 @@ give the compliance C = Theta/T_d at the excited lines, and the displayed
 impedance Z = 1/C (mean and standard error over periods).
 
 Rendered impedance. The near-free target (weak centering spring K_c rendered
-by the firmware, B = 0) measures the device itself, Z_free = -J w^2 + j w b + K_c,
-including friction-equivalent damping and transmission dynamics. Subtracting it
-line by line,
+by the 500 Hz loop, B = 0) measures the device itself, Z_free = -J w^2 + j w b +
+K_c e^{-j w T_loop}, including friction-equivalent damping and transmission
+dynamics; T_loop is the loop's logged delay (2 SYNC periods: the CST ramp).
+Subtracting it line by line,
 
-    Z_r(w) = Z_target(w) - Z_free(w) + K_c,
+    Z_r(w) = Z_target(w) - Z_free(w) + K_c e^{-j w T_loop},
 
 cancels inertia, damping and friction without a model of the device, leaving
 what the loop renders. Rendered stiffness K_r = Re Z_r, rendered damping
@@ -42,7 +43,7 @@ import pandas as pd
 from scipy import optimize
 
 import device_config
-from analysis_common import (cogging_torque, export_figure, fit_sinusoids, latest_cogging_model,
+from analysis_common import (applied_torque_times, cogging_torque, loop_timing, pwl_fourier, export_figure, fit_sinusoids, latest_cogging_model,
                              load_run, make_parser, print_header,
                              print_truth_comparison, save_outputs, sim_truth)
 from experiment_common import latest_summary
@@ -74,34 +75,47 @@ def position_column(df):
     return 'joint_pos_deg'
 
 
-def estimate_target(frame, design, column, cogging=None):
+def estimate_target(frame, design, column, cogging=None, loop=None):
     """Displayed impedance per period at the excited lines; mean and SE.
 
     With a cogging model, the cogging torque at the measured motor position is
     taken out of the input torque: it is an internal, position-dependent torque
     whose apparent stiffness and damping depend on the motion amplitude, so it
     would not cancel in the line-by-line subtraction of the near-free target.
+
+    Timing. moteus rows are one command/reply each: torque and position both
+    belong to the command's arrival. p4wrist rows are loop cycles (loop =
+    {'delay_s', 'period_s'} from the run): the disturbance is the design value
+    at the host's send time, and the loop's torque reaches it by a linear ramp
+    ending loop_delay after the cycle that used it (piecewise linear, Fourier
+    coefficients exact); positions are sampled at the cycle's SYNC.
     """
     freqs = np.asarray(design['freqs_hz'])
     period = float(design['period_s'])
     signal = Multisine(design['freqs_hz'], design['amplitudes_nm'], design['phases_rad'],
                        design['t_offset_s'])
     t_local = frame['t_local'].to_numpy()
-    arrive = t_local + 0.5 * (frame['time'].to_numpy() - frame['t_send'].to_numpy())
-    torque = np.array([signal(t)[0] for t in t_local])
+    lag = frame['time'].to_numpy() - frame['t_send'].to_numpy()
+    if loop:
+        torque = np.array([signal(t)[0] for t in t_local - lag])
+        t_torque = applied_torque_times(t_local, loop)
+        t_theta = t_local
+    else:
+        torque = np.array([signal(t)[0] for t in t_local])
+        t_torque = t_theta = t_local + 0.5 * lag
     theta = np.radians(frame[column].to_numpy())
     cog = (cogging_torque(cogging, frame['motor_pos_rev'].to_numpy())
            if cogging is not None and 'motor_pos_rev' in frame else None)
     Z, residual, motion = [], [], []
     for p in range(1, int(design['periods'])):
         t0, t1 = p * period, (p + 1) * period
-        sel = (arrive >= t0) & (arrive < t1)
-        if sel.sum() < 4 * len(freqs):
+        sel = (t_theta >= t0) & (t_theta < t1)
+        if sel.sum() < 4 * len(freqs) or ((t_torque >= t0) & (t_torque < t1)).sum() < 4 * len(freqs):
             continue
-        T = zoh_fourier(arrive, torque, freqs, t0, t1)
+        T = (pwl_fourier if loop else zoh_fourier)(t_torque, torque, freqs, t0, t1)
         if cog is not None:
-            T = T - fit_sinusoids(arrive[sel], cog[sel], freqs)[0]
-        X, res = fit_sinusoids(arrive[sel], theta[sel], freqs)
+            T = T - fit_sinusoids(t_theta[sel], cog[sel], freqs)[0]
+        X, res = fit_sinusoids(t_theta[sel], theta[sel], freqs)
         Z.append(T / X)
         residual.append(res)
         motion.append(float(np.std(theta[sel])))
@@ -253,21 +267,36 @@ def zwidth_reference(run):
     return run_dir, ref
 
 
+def expected_delay_s(run, target):
+    """Nominal rendering delay of a target's loop (position term; a damping term,
+    filtered and differenced, lags more).
+
+    moteus host loop: 1.5 command periods. p4wrist: the 500 Hz loop reaches the
+    motor 2 SYNC periods after its sample (the CST ramp); a host loop adds the
+    sample's age (one loop period) and half its own period (zero-order hold)."""
+    loop = loop_timing(run)
+    if loop is None:
+        return 1.5 / target['rate_hz']
+    if target['renderer'] == 'rt':
+        return loop['delay_s']
+    return loop['delay_s'] + loop['period_s'] + 0.5 / target['rate_hz']
+
+
 def frame_modes(df, target_id):
-    """Logged moteus mode register for a target's excitation (numeric column)."""
+    """Logged mode column for a target's excitation (numeric)."""
     frame = df[(df['phase'] == 'excite') & (df['target_id'] == target_id)]
     return pd.to_numeric(frame['mode'], errors='coerce') if 'mode' in frame else pd.Series(dtype=float)
 
 
 def target_label(t):
     mode = t['mode']
-    loop = 'firmware' if mode == 'moteus' else f"host {float(mode.split('_')[1]) / 1000:g} kHz"
+    loop = '500 Hz loop' if mode == 'rt' else f"host {float(mode.split('_')[1]):g} Hz"
     return f"{loop}, $K$={t['k_nm_rad']:g}, $B$={t['b_nms_rad']:g}"
 
 
 # --- figures ---------------------------------------------------------------------------
 def choose_shown(results):
-    """Up to three stiff targets: a firmware/host matched pair, then a host B = 0 target."""
+    """Up to three stiff targets: a loop/host matched pair, then a host B = 0 target."""
     stiff = [r for r in results if r['k_nm_rad'] >= DELAY_MIN_K_NM_RAD or r['renderer'] == 'host']
     stiff = [r for r in stiff if r.get('fit')]
     shown = []
@@ -275,7 +304,7 @@ def choose_shown(results):
         for other in stiff:
             if (other is not r and other['renderer'] != r['renderer']
                     and other['k_nm_rad'] == r['k_nm_rad'] and other['b_nms_rad'] == r['b_nms_rad']):
-                shown = sorted([r, other], key=lambda x: x['renderer'] != 'moteus')
+                shown = sorted([r, other], key=lambda x: x['renderer'] != 'rt')
                 break
         if shown:
             break
@@ -437,20 +466,33 @@ def main(argv=None):
     excite = df[df['phase'] == 'excite']
 
     cogging = latest_cogging_model(run.simulated)
+    loop = loop_timing(run)
     results = []
     for t in targets:
         frame = excite[excite['target_id'] == t['target_id']] if 'target_id' in excite else excite.iloc[0:0]
-        est = (estimate_target(frame, t['design'], column, cogging)
+        est = (estimate_target(frame, t['design'], column, cogging, loop)
                if (not t.get('skipped') and len(frame)) else None)
         results.append({**t, **(est or {}), 'measured': est is not None})
     measured = [r for r in results if r['measured']]
     if not measured:
         raise SystemExit('No target was measured (all skipped or stopped).')
 
-    # Near-free reference: firmware loop preferred, lowest K, B = 0.
+    # Near-free reference: the 500 Hz loop preferred, lowest K, B = 0.
     candidates = sorted([r for r in measured if r['b_nms_rad'] == 0],
-                        key=lambda r: (r['renderer'] != 'moteus', r['k_nm_rad']))
+                        key=lambda r: (r['renderer'] != 'rt', r['k_nm_rad']))
     free = candidates[0] if candidates and candidates[0]['k_nm_rad'] < FREE_K_MAX_NM_RAD else None
+    # The reference's own spring reaches the joint through the loop delay (the
+    # p4wrist CST ramp: 2 SYNC periods); K_c e^{-j w T} is what it renders, and
+    # treating it as a delay-free K_c would bias every target by -K_c T of damping.
+    ref_delay_s = (float(run.meta.get('loop_delay_s') or 0.0)
+                   if free is not None and free['renderer'] == 'rt' else 0.0)
+    if free is not None:
+        free = dict(free)
+        w_free = 2 * np.pi * free['freqs']
+        k_c = free['k_nm_rad']
+        # Device impedance plus a delay-free K_c, the form fit_free and the
+        # line-by-line subtraction expect.
+        free['Z'] = free['Z'] - k_c * np.exp(-1j * w_free * ref_delay_s) + k_c
     free_fit = fit_free(free['freqs'], free['Z'], free['se'], free['k_nm_rad']) if free else None
     if free_fit is None:
         found = latest_summary('step_response', run.simulated)
@@ -461,7 +503,9 @@ def main(argv=None):
         reference_source = 'rigid model (step response or nominal): no near-free target'
     else:
         J_ref, b_ref = free_fit['J_kg_m2'], free_fit['b_nms_rad']
-        reference_source = f"near-free target {free['target_id']} (line-by-line subtraction)"
+        reference_source = (f"near-free target {free['target_id']} (line-by-line subtraction"
+                            + (f", its spring removed at the {1e3 * ref_delay_s:g} ms loop delay)"
+                               if ref_delay_s else ')'))
     b_linear, b_source = linear_damping(run)
     damping_min = damping_band_min_hz(free) if free is not None else float(
         measured[0]['freqs'][0])
@@ -587,7 +631,7 @@ def main(argv=None):
         'max_rel_se': MAX_REL_SE, 'fidelity_mag': FIDELITY_MAG,
         'fidelity_phase_deg': FIDELITY_PHASE_DEG,
         'zwidth_source': str(zw_run) if zw_run else None,
-        'note': ('Torques are in the moteus torque scale. Without an output encoder the motion '
+        'note': ('Torques are in the drive torque scale. Without an output encoder the motion '
                  'is motor-side; transmission compliance cancels in the subtraction but not in '
                  'the free-space inertia spectrum.'),
     }
@@ -659,10 +703,10 @@ def main(argv=None):
         for t in targets:
             mode = t['mode']
             key = f'impedance_delay_{mode}_ms'
-            if t['renderer'] == 'host' and key in summary and \
+            delayed = t['renderer'] == 'host' or loop_timing(run) is not None
+            if delayed and key in summary and \
                     summary.get(f'impedance_delay_{mode}_target_id') == t['target_id']:
-                # One sample measurement-to-application + half a sample of ZOH + current lag.
-                expected = 1000.0 * (1.5 / t['rate_hz'] + truth['current_loop_time_constant'])
+                expected = 1000.0 * (expected_delay_s(run, t) + truth['current_loop_time_constant'])
                 rows.append((f'{mode} delay (approx. truth)', summary[key], expected, 'ms'))
         print_truth_comparison(rows)
         print(f"  (free-space damping {free_fit['b_nms_rad']:.4g} includes friction-equivalent "

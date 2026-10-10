@@ -9,7 +9,7 @@ operator (manual force gauge). torque_calibration_experiment_analysis.py fits
     measured = k * commanded + offset
 
 where k (actual / commanded torque) corrects every torque-derived quantity
-(J, b, fc, stiffness) identified from moteus-reported torques, and reports
+(J, b, fc, stiffness) identified from drive-reported torques, and reports
 nonlinearity and hysteresis. Approaching each level from both sides exposes
 transmission friction as hysteresis.
 
@@ -19,11 +19,11 @@ import math
 from dataclasses import asdict, dataclass
 
 import device_config
-from experiment_common import (Command, MoteusSession, SafetyAbort, SafetyLimits, Segment,
+from experiment_common import (Command, WristSession, SafetyAbort, SafetyLimits, Segment,
                                confirm, describe_plan, make_arg_parser, min_jerk, run_cli)
 
 EXPERIMENT = 'torque_calibration'
-SIM_PARAMS = None   # Tests inject a moteus_sim.SimParams here.
+SIM_PARAMS = None   # Tests inject a p4_sim.SimParams here.
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
@@ -123,7 +123,7 @@ def plan_checks(cfg):
 
 def sensor_note(sensor_config):
     kind = (sensor_config or {}).get('type')
-    if kind == 'manual' or kind == 'moteus_analog':
+    if kind == 'manual':
         arm = sensor_config.get('lever_arm_m')
         where = f'at the lever arm of {arm} m set in device_config' if arm else 'on the axis'
         return (f'Block the handle with the load cell / force gauge {where}. The motor pushes '
@@ -173,7 +173,7 @@ async def main(args):
                           joint_max_deg=cfg.max_deflection_deg,
                           max_joint_velocity_deg_s=cfg.max_slip_velocity_deg_s)
 
-    async with MoteusSession(EXPERIMENT, args, 0.0, 0.0, config=asdict(cfg),
+    async with WristSession(EXPERIMENT, args, 0.0, 0.0, config=asdict(cfg),
                              rate_hz=cfg.sample_rate_hz, needs_sensor=True,
                              sim_params=SIM_PARAMS, limits=limits,
                              max_torque_nm=cfg.test_torque_nm * 1.05) as session:

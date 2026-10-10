@@ -35,9 +35,9 @@ from scipy import signal
 
 import device_config
 from experiment_common import latest_summary
-from analysis_common import (bootstrap_ci, export_figure, load_run, make_parser,
-                             print_header, print_truth_comparison, robust_sigma, save_outputs,
-                             sim_truth)
+from analysis_common import (bootstrap_ci, correct_for_loop, export_figure, load_run,
+                             loop_delays, make_parser, print_header, print_truth_comparison,
+                             robust_sigma, save_outputs, sim_truth)
 from ieee_plot import (INK, MUTED, TORQUE_UNIT, add_panel_label, configure_ieee_style,
                        figure_size, ordinal_colors, reference_line, style_axis)
 
@@ -179,8 +179,11 @@ def extract_half_cycles(seg_id, frame, kp, nominal_period):
 
 
 # --- identification ---------------------------------------------------------------
-def identify(half_cycles, kp):
-    """Pooled regression a_next = b0 + b1 a_n + b2 d_n and half-period median."""
+def identify(half_cycles, kp, kd=0.0, delays=None):
+    """Pooled regression a_next = b0 + b1 a_n + b2 d_n and half-period median.
+
+    The ring-down shows the loop (spring Kp, damping b + Kd); J and b are then
+    corrected for Kd and the loop delays (analysis_common.correct_for_loop)."""
     excluded = half_cycles['saturated']
     for flag in ('torque_limited', 'in_deadband'):
         if flag in half_cycles:
@@ -200,11 +203,15 @@ def identify(half_cycles, kp):
     ln_r = -math.log(r)
     zeta = ln_r / math.sqrt(math.pi ** 2 + ln_r ** 2)
     wn = wd / math.sqrt(1.0 - zeta ** 2)
-    J = kp / wn ** 2
+    J_app = kp / wn ** 2
+    b_app = 2.0 * J_app * zeta * wn
+    J, b = correct_for_loop(J_app, b_app, kp, kd, delays or {'position': 0.0, 'velocity': 0.0})
     residual = hc['a_next_rad'].to_numpy() - A @ coef
     return {
         'J_kg_m2': J,
-        'b_nms_rad': 2.0 * J * zeta * wn,
+        'b_nms_rad': b,
+        'J_apparent_kg_m2': J_app,
+        'b_apparent_nms_rad': b_app,
         'zeta': zeta,
         'wn_rad_s': wn,
         'fn_hz': wn / (2 * math.pi),
@@ -349,6 +356,9 @@ def main(argv=None):
     run = load_run(EXPERIMENT, args.data, LEGACY)
     df = run.df
     kp = float(run.meta_value('kp_joint_nm_rad', column='kp_joint_nm_rad'))
+    kd = float(df.loc[df['phase'] == 'step', 'kd_joint_nms_rad'].median()) \
+        if 'kd_joint_nms_rad' in df else 0.0
+    delays = loop_delays(run)
     nominal_period = 2 * math.pi * math.sqrt(device_config.NOMINAL_JOINT_INERTIA_KG_M2 / kp)
 
     steps, rows = [], []
@@ -368,7 +378,7 @@ def main(argv=None):
     deadband = float(2.0 * np.median(rest)) if len(rest) else 0.0
     min_start = 0.5 * DEADBAND_FACTOR * deadband
     half_cycles['in_deadband'] = half_cycles['a_n_rad'].abs() < min_start
-    est = identify(half_cycles, kp)
+    est = identify(half_cycles, kp, kd, delays)
     if est is None:
         raise SystemExit('Identification failed: decay ratio outside (0, 1).')
 
@@ -377,14 +387,14 @@ def main(argv=None):
 
     # Bootstrap over whole steps (all parameters from the same resamples).
     by_step = [g for _, g in half_cycles.groupby('segment')]
-    ci = bootstrap_ci(by_step, lambda gs: identify(pd.concat(gs), kp),
+    ci = bootstrap_ci(by_step, lambda gs: identify(pd.concat(gs), kp, kd, delays),
                       keys=('J_kg_m2', 'b_nms_rad', 'zeta', 'fc_nm', 'fn_hz'))
 
     # Per step size: amplitude dependence check.
     sizes = sorted(half_cycles['step_size_deg'].unique())
     per_size = []
     for size in sizes:
-        e = identify(half_cycles[half_cycles['step_size_deg'] == size], kp)
+        e = identify(half_cycles[half_cycles['step_size_deg'] == size], kp, kd, delays)
         if e:
             per_size.append({'step_size_deg': size, **e})
     per_size = pd.DataFrame(per_size)
@@ -417,6 +427,9 @@ def main(argv=None):
         **{f'{k}_ci95_low': v[0] for k, v in ci.items()},
         **{f'{k}_ci95_high': v[1] for k, v in ci.items()},
         'kp_joint_nm_rad': kp,
+        'kd_joint_nms_rad': kd,
+        'loop_delay_position_s': delays['position'],
+        'loop_delay_velocity_s': delays['velocity'],
         'static_friction_used_in_replay_nm': static_for_model,
         'model_fit_percent_median': float(per_step['fit_percent'].median()),
         'model_fit_percent_min': float(per_step['fit_percent'].min()),
@@ -436,7 +449,7 @@ def main(argv=None):
         'shortfall_fraction': SHORTFALL_FRACTION,
         'shortfall_floor_nm': SHORTFALL_FLOOR_NM,
         'deadband_factor': DEADBAND_FACTOR,
-        'note': ('J, b and fc are in the torque scale moteus reports; multiply by the '
+        'note': ('J, b and fc are in the torque scale the drives report; multiply by the '
                  'torque calibration ratio if one was measured.'),
     }
     save_outputs(run, {'half_cycles': half_cycles, 'per_step': per_step,

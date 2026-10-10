@@ -1,4 +1,3 @@
-moteus
 numpy
 pandas
 scipy

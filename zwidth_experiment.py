@@ -4,11 +4,11 @@ A virtual spring-damper
 
     tau = -K (th - th0) - B th'
 
-is rendered about a fixed pose, either by the moteus position loop at its
-internal rate ('moteus' mode, the hardware/firmware limit) or by this host,
-which computes the torque from the latest measurement and sends it as a
-feedforward torque ('host_<rate>' modes, the situation of a PC-side haptic
-simulation with one sample of delay plus communication latency). For each B
+is rendered about a fixed pose, either by the p4wrist 500 Hz loop ('rt'
+mode, the limit of the wrist's own loop) or by this host, which computes the
+torque from the latest measurement and sends it as a feedforward torque
+('host_<rate>' modes, the situation of a PC-side haptic simulation, adding
+its own period and sample age to the loop's delay). For each B
 the stiffness K is raised geometrically until a short torque pulse produces a
 sustained or growing oscillation; the largest stable K per B traces the
 Z-width boundary (Colgate & Brown, 1994).
@@ -27,26 +27,26 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 import device_config
-from experiment_common import (Command, MoteusSession, Segment, confirm, hold, make_arg_parser,
+from experiment_common import (Command, WristSession, Segment, confirm, hold, make_arg_parser,
                                min_jerk_move, run_cli)
 
 EXPERIMENT = 'zwidth'
-SIM_PARAMS = None   # Tests may inject a moteus_sim.SimParams
+SIM_PARAMS = None   # Tests may inject a p4_sim.SimParams
 
 
 # --- USER CONFIGURATION -----------------------------------------------------------
 @dataclass
 class ZWidthConfig:
-    modes: tuple = ('host_1000', 'moteus')   # 'moteus' and/or 'host_<rate_hz>' (max 3)
+    modes: tuple = ('host_250', 'rt')   # 'rt' and/or 'host_<rate_hz>' (max 3)
     damping_values_nms_rad: tuple = (0.0, 0.05, 0.1, 0.2, 0.5)
-    k_start_host_nm_rad: float = 5.0
-    k_max_host_nm_rad: float = 1000.0
-    k_start_moteus_nm_rad: float = 50.0
-    k_max_moteus_nm_rad: float = 10000.0    # Raise to find the firmware limit
+    k_start_host_nm_rad: float = 2.0
+    k_max_host_nm_rad: float = 300.0
+    k_start_rt_nm_rad: float = 10.0
+    k_max_rt_nm_rad: float = 1000.0     # Raise to find the loop's limit
     k_factor: float = 1.4                    # Geometric stiffness increment
     refine_steps: int = 1                    # Bisection trials between stable and unstable
     center_deg: float = 0.0                  # Pose the impedance is rendered about
-    safe_k_nm_rad: float = 20.0              # Hold between trials (moteus PD)
+    safe_k_nm_rad: float = 20.0              # Hold between trials (loop PD)
     safe_b_nms_rad: float = 0.3
     settle_s: float = 0.6                    # Safe hold before each trial (noise floor)
     pulse_start_s: float = 0.2               # Test impedance active before the pulse
@@ -58,7 +58,7 @@ class ZWidthConfig:
     max_deviation_deg: float = 8.0           # Trial stops (unstable) beyond this
     max_velocity_deg_s: float = 600.0
     return_speed_deg_s: float = 30.0
-    sample_rate_hz: float = 1000.0           # Holds and moteus-mode trials
+    sample_rate_hz: float = 500.0            # Holds and rt-mode trials
 
 
 QUICK = dict(damping_values_nms_rad=(0.0, 0.3), k_factor=2.0, refine_steps=1,
@@ -78,17 +78,17 @@ CHATTER_SIGN_CHANGES = 8         # ... with this many sign changes -> chatter
 
 
 def parse_mode(name, cfg):
-    if name == 'moteus':
-        return {'name': name, 'renderer': 'moteus', 'rate_hz': cfg.sample_rate_hz,
-                'k_start': cfg.k_start_moteus_nm_rad, 'k_max': cfg.k_max_moteus_nm_rad}
+    if name == 'rt':
+        return {'name': name, 'renderer': 'rt', 'rate_hz': cfg.sample_rate_hz,
+                'k_start': cfg.k_start_rt_nm_rad, 'k_max': cfg.k_max_rt_nm_rad}
     if name.startswith('host_'):
         try:
             rate = float(name.split('_', 1)[1])
         except ValueError:
-            raise SystemExit(f'Bad mode {name!r}; use host_<rate_hz>, e.g. host_1000.')
+            raise SystemExit(f'Bad mode {name!r}; use host_<rate_hz>, e.g. host_250.')
         return {'name': name, 'renderer': 'host', 'rate_hz': rate,
                 'k_start': cfg.k_start_host_nm_rad, 'k_max': cfg.k_max_host_nm_rad}
-    raise SystemExit(f'Unknown mode {name!r}; use "moteus" or "host_<rate_hz>".')
+    raise SystemExit(f'Unknown mode {name!r}; use "rt" or "host_<rate_hz>".')
 
 
 # --- stability classification (also used by the analysis) --------------------------
@@ -207,8 +207,8 @@ def host_command(K, B, theta0, cap, cfg):
     return command
 
 
-def moteus_command(theta0, cap, cfg):
-    """moteus renders K and B (set via set_gains); the host only adds the pulse."""
+def rt_command(theta0, cap, cfg):
+    """The 500 Hz loop renders K and B (set via set_gains); the host only adds the pulse."""
     t_on, t_off = cfg.pulse_start_s, cfg.pulse_start_s + cfg.pulse_width_s
 
     def command(t, _):
@@ -252,9 +252,9 @@ async def run_trial(session, cfg, mode, K, B, trial_id, theta0, cap):
                                       [r['joint_pos_deg'] - theta0 for r in settle.rows],
                                       [r['joint_torque_nm'] for r in settle.rows])
 
-    if mode['renderer'] == 'moteus':
+    if mode['renderer'] == 'rt':
         await session.set_gains(K, B)
-        command = moteus_command(theta0, cap, cfg)
+        command = rt_command(theta0, cap, cfg)
     else:
         command = host_command(K, B, theta0, cap, cfg)
     trial = await session.run_segment(Segment(
@@ -264,7 +264,7 @@ async def run_trial(session, cfg, mode, K, B, trial_id, theta0, cap):
     # Contain: brake (passive damping), restore the safe hold, return to center.
     session.log_event('brake', trial_id=trial_id, ended_by=trial.ended_by)
     await session.brake(cfg.brake_s, info={'trial_id': trial_id})
-    if mode['renderer'] == 'moteus':
+    if mode['renderer'] == 'rt':
         await session.set_gains(cfg.safe_k_nm_rad, cfg.safe_b_nms_rad)
     here = await session.command(Command(position_deg=math.nan))   # Hold where it stopped
     await session.run_segment(min_jerk_move(here['joint_pos_deg'], theta0,
@@ -357,7 +357,7 @@ async def main(args):
     modes = [parse_mode(m, cfg) for m in cfg.modes]
     check_plan(cfg, modes)
     per_trial_s = cfg.settle_s + trial_duration(cfg) + cfg.brake_s + 0.5
-    async with MoteusSession(EXPERIMENT, args, cfg.safe_k_nm_rad, cfg.safe_b_nms_rad,
+    async with WristSession(EXPERIMENT, args, cfg.safe_k_nm_rad, cfg.safe_b_nms_rad,
                              config=asdict(cfg), rate_hz=cfg.sample_rate_hz,
                              sim_params=SIM_PARAMS) as session:
         cap = cfg.torque_cap_fraction * session.max_torque_nm
