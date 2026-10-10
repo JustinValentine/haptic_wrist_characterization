@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+import numpy as np
+
 import device_config
 
 DATA_ROOT = Path('data')
@@ -44,6 +46,7 @@ DATA_ROOT = Path('data')
 # Logged 'mode' column, numbered as moteus modes so old and new logs read alike.
 MODE_STOPPED = 0
 MODE_FAULT = 1
+MODE_DRIVE = 8          # the drives' own position loops (CSP) render the joints
 MODE_POSITION = 10
 MODE_TIMEOUT = 11
 MODE_STAY_WITHIN = 13
@@ -113,6 +116,8 @@ RESERVED_COLUMNS = frozenset({
     'q_ps_deg', 'q_fe_deg', 'q_ur_deg', 'tau_cmd_ps_nm', 'tau_cmd_fe_nm', 'tau_cmd_ur_nm',
     'tau_meas_ps_nm', 'tau_meas_fe_nm', 'tau_meas_ur_nm', 'counts_6', 'counts_7', 'counts_8',
     'permille_6', 'permille_7', 'permille_8', 'current_6_a', 'current_7_a', 'current_8_a',
+    'motor_angle_6', 'motor_angle_7', 'motor_angle_8', 'drive_demand_nm', 'drive_loop',
+    'target_6', 'target_7', 'target_8',
 })
 
 
@@ -620,6 +625,8 @@ class WristSession:
         self._ext_by_cycle = []
         self._fault_text = ''
         self._p4 = None
+        self.loop = 'pc'              # 'pc': the p4wrist loop's PD; 'drive': the pucks' own loops
+        self.drive_gains = None       # raw gains per motor while the drive loop runs
         # Primary motor of the joint under test (reports its current and
         # temperatures) and the sign that makes its current follow joint torque.
         col = [device_config.J2MP[i][self.j] for i in range(3)]
@@ -636,7 +643,12 @@ class WristSession:
         config = wrist_config(p4wrist, self.is_sim)
         if self.is_sim:
             import p4_sim
-            params = self.sim_params or p4_sim.SimParams()
+            params = self.sim_params
+            drive_file = Path(device_config.DRIVE_PARAMS_FILE)
+            if params is None and device_config.SIM_USES_DRIVE_PARAMS and drive_file.exists():
+                params = p4_sim.params_from_drive_file(drive_file)
+                self.metadata['sim_params_source'] = str(drive_file)
+            params = params or p4_sim.SimParams()
             params.seed = getattr(self.args, 'seed', params.seed)
             params.j2mp = device_config.J2MP
             params.initial_q = tuple(math.radians(x) for x in device_config.HOME_DEG)
@@ -671,11 +683,93 @@ class WristSession:
                        _SegmentMeta(-1, 'start', {}, self.clock.now(), False))
             self.metadata['drive_info'] = self.wrist.drive_info()
             self._limit_torque_to_drives()
+            self._record_drives()
+            await self._probe_loop_delay()
         except BaseException:
             self._shutdown()
             raise
         self._t_started = datetime.now(timezone.utc).isoformat()
         return self
+
+    def _record_drives(self):
+        """Whether torque is measured, and (hardware) the pucks' motor data for the simulator."""
+        info = self.metadata['drive_info']
+        self.metadata['torque_measured'] = all(d['current_mapped'] for d in info)
+        self.metadata['drive_torque_demand_logged'] = all(d['torque_demand_mapped'] for d in info)
+        if not self.metadata['torque_measured']:
+            print('WARNING: a puck did not map its q-axis current into the position message: '
+                  'joint_torque_nm is NaN and analyses fall back to commanded torque.', file=sys.stderr)
+        if not self.is_sim:
+            write_json(device_config.DRIVE_PARAMS_FILE, {
+                'drive_info': info, 'nodes': list(device_config.NODES),
+                'counts_per_rev': info[0]['counts_per_rev'],
+                'recorded_utc': datetime.now(timezone.utc).isoformat()})
+
+    async def _probe_loop_delay(self):
+        """Measure the command-to-torque delay: alternating small torque pulses on the
+        joint under test; the drive's measured current shows, cycle by cycle, when
+        each command arrives at the motor. Also checks the current-to-torque scale:
+        measured / commanded torque should be ~1."""
+        period = device_config.LOOP_PERIOD_S
+        nominal = 2.0 * period
+        self.metadata['loop_delay_nominal_s'] = nominal
+        self.metadata['loop_delay_s'] = nominal
+        self.metadata['loop_delay_source'] = 'nominal: 2 SYNC periods (CST ramp)'
+        if not device_config.MEASURE_LOOP_DELAY:
+            return
+        if not self.metadata.get('torque_measured'):
+            self.metadata['loop_delay_source'] += '; not measured (no current feedback)'
+            return
+        p4 = self._p4
+        tau = min(device_config.LOOP_DELAY_PROBE_NM, 0.5 * self.max_torque_nm)
+        name = JOINT_NAMES[self.j]
+        on, off, reps = 10, 15, 3
+        self.wrist.read_log()   # start clean
+        for k in range(reps * 2):
+            for torque in ((tau if k % 2 == 0 else -tau), 0.0):
+                cmd = p4.Command()
+                self._seq += 1
+                cmd.seq = self._seq
+                for j, n in enumerate(JOINT_NAMES):
+                    cmd.joint[j] = p4.joint_command(
+                        position=self.start_q[j], kp=device_config.HOLD_KP_NM_RAD[n],
+                        kd=device_config.HOLD_KD_NMS_RAD[n], torque=torque if j == self.j else 0.0,
+                        max_torque=device_config.HOLD_MAX_TORQUE_NM + tau)
+                self.wrist.set_command(cmd)
+                await self.clock.sleep((on if torque else off) * period)
+        log, _ = self.wrist.read_log()
+        p = self._primary
+        info = self.metadata['drive_info'][p]
+        commanded = log['permille'][:, p] / 1000.0 * info['rated_torque_mnm'] / 1000.0
+        measured = (log['current'][:, p] * info['kt_mnm_per_a'] / 1000.0
+                    * device_config.CURRENT_TORQUE_FACTOR)
+        best = None
+        for lag in range(0, 7):
+            c, m = commanded[:len(commanded) - lag], measured[lag:]
+            if len(c) < 20 or not np.isfinite(m).all():
+                continue
+            err = float(np.mean((m - c) ** 2))
+            if best is None or err < best[1]:
+                best = (lag, err)
+        if best is None:
+            self.metadata['loop_delay_source'] += '; probe failed'
+            return
+        lag = best[0]
+        c, m = commanded[:len(commanded) - lag], measured[lag:]
+        scale = float(np.dot(c, m) / np.dot(c, c)) if np.dot(c, c) > 0 else math.nan
+        self.metadata['loop_delay_s'] = lag * period
+        self.metadata['loop_delay_probe'] = {
+            'cycles': lag, 'probe_torque_nm': tau, 'joint': name, 'pulses': reps * 2,
+            'measured_over_commanded_torque': scale,
+            'rms_mismatch_nm': math.sqrt(best[1])}
+        self.metadata['loop_delay_source'] = (f'measured: {lag} cycles from command to measured '
+                                              'current (start-of-run probe)')
+        if lag != 2:
+            print(f'NOTE: commands reach the motors {lag} loop cycles after they are computed '
+                  '(nominal 2); the analyses use the measured value.')
+        if math.isfinite(scale) and abs(scale - 1.0) > 0.15:
+            print(f'WARNING: measured/commanded torque is {scale:.2f} during the delay probe; check '
+                  'CURRENT_TORQUE_FACTOR (Kt convention) before trusting torque values.')
 
     def _limit_torque_to_drives(self):
         """Cap commands at what the motors can deliver to this joint: a pure
@@ -741,6 +835,25 @@ class WristSession:
             self.save()
         return False
 
+    def _timing_summary(self):
+        """How cleanly the loop ran: late cycles, missed positions, gaps, log overflow."""
+        period = device_config.LOOP_PERIOD_S
+        if not self.rows:
+            return {}
+        late = np.array([r.get('late_ms', 0.0) for r in self.rows], dtype=float)
+        missed = np.array([r.get('missed_feedback', 0) for r in self.rows])
+        t = np.array([r['time'] for r in self.rows], dtype=float)
+        cycle = np.array([r.get('loop_cycle', 0) for r in self.rows])
+        consecutive = np.diff(cycle) == 1
+        gaps = np.diff(t)[consecutive] if len(t) > 1 else np.zeros(0)
+        overflow = sum(e.get('dropped', 0) for e in self.events if e['event'] == 'log_overflow')
+        return {'num_cycles': int(len(t)),
+                'late_fraction': float(np.mean(late > 500.0 * period)),
+                'max_late_ms': float(np.nanmax(late)) if len(late) else 0.0,
+                'missed_feedback_cycles': int(np.count_nonzero(missed)),
+                'max_gap_ms': float(1000.0 * gaps.max()) if len(gaps) else 0.0,
+                'log_overflow_cycles': int(overflow)}
+
     def _shutdown(self):
         try:
             if self.wrist is not None:
@@ -770,6 +883,14 @@ class WristSession:
         out.seq = self._seq
         out.t_host = t
         out.brake = 1 if brake else 0
+        drive = self.loop == 'drive' and not brake
+        if drive:
+            if cmd.stay_within is not None:
+                raise ValueError('The drive loop cannot render a one-sided wall (stay_within).')
+            if cmd.kp_scale != 1.0 or cmd.kd_scale != 1.0:
+                raise ValueError('The drive loop renders fixed gains: change them with set_gains, '
+                                 'not kp_scale/kd_scale.')
+            out.drive_loop = 1
         for j, name in enumerate(JOINT_NAMES):
             if j == self.j:
                 continue
@@ -828,8 +949,9 @@ class WristSession:
         q, qd = rec['q'], rec['qd']
         state, fault = int(rec['wrist_state']), int(rec['fault'])
         p4 = self._p4
+        drive = bool(rec['drive_loop'])
         if state == p4.STATE_ACTIVE:
-            mode = int(rec['joint_mode'][j])
+            mode = MODE_DRIVE if drive else int(rec['joint_mode'][j])
         elif state == p4.STATE_BRAKE:
             mode = MODE_BRAKE
         elif state in (p4.STATE_BRAKING, p4.STATE_FAULT):
@@ -865,7 +987,10 @@ class WristSession:
             'q_current_a': self._current_sign * float(rec['current'][p]),
             'control_joint_deg': math.degrees(setpoint - q0[j]) if math.isfinite(setpoint) else math.nan,
             'control_joint_vel_deg_s': math.degrees(float(rec['setpoint_velocity'][j])),
-            'control_joint_torque_nm': float(rec['tau_cmd'][j]),
+            # The loop's command; in the drive loop, the drive's own demand.
+            'control_joint_torque_nm': float(rec['tau_demand'][j] if drive else rec['tau_cmd'][j]),
+            'drive_demand_nm': float(rec['tau_demand'][j]),
+            'drive_loop': int(drive),
             'voltage_v': float(rec['bus_voltage'][p]),
             'board_temp_c': float(rec['amp_temp'][p]),
             'motor_temp_c': motor_temp,
@@ -880,6 +1005,9 @@ class WristSession:
             row[f'tau_cmd_{name}_nm'] = float(rec['tau_cmd'][k])
             row[f'tau_meas_{name}_nm'] = float(rec['tau_meas'][k])
         for i, node in enumerate(device_config.NODES):
+            row[f'motor_angle_{node}'] = float(rec['motor_angle'][i])
+            if drive:
+                row[f'target_{node}'] = int(rec['motor_target'][i])
             row[f'counts_{node}'] = int(rec['counts'][i])
             row[f'permille_{node}'] = int(rec['permille'][i])
             row[f'current_{node}_a'] = float(rec['current'][i])
@@ -1005,11 +1133,53 @@ class WristSession:
         return await self.hold_until(future, command, phase, info)
 
     async def set_gains(self, kp_joint_nm_rad, kd_joint_nms_rad):
-        """Joint-side PD gains for subsequent commands (applied by the loop every cycle)."""
+        """Joint-side PD gains for subsequent commands: applied by the p4wrist loop every
+        cycle, or written to the drives when the drive loop is in use."""
         self.kp_joint = kp_joint_nm_rad
         self.kd_joint = kd_joint_nms_rad
+        if self.loop == 'drive':
+            self._apply_drive_gains(kp_joint_nm_rad, kd_joint_nms_rad)
         self.log_event('set_gains', kp_joint_nm_rad=kp_joint_nm_rad,
-                       kd_joint_nms_rad=kd_joint_nms_rad)
+                       kd_joint_nms_rad=kd_joint_nms_rad, loop=self.loop)
+
+    async def use_drive_loop(self, kp_joint_nm_rad=None, kd_joint_nms_rad=None):
+        """Render with the pucks' own position loops (CSP) from the next command on.
+
+        Each puck closes its loop on its own motor at its control rate, so this is
+        the wrist's delay-free rendering, the analogue of moteus' firmware loop.
+        The motors of FE and UR are shared, so both joints get the same stiffness
+        and damping; damping must be positive (the drive's velocity loop is what
+        makes the torque). Gains come from the latest drive-gain calibration."""
+        self.loop = 'drive'
+        await self.set_gains(self.kp_joint if kp_joint_nm_rad is None else kp_joint_nm_rad,
+                             self.kd_joint if kd_joint_nms_rad is None else kd_joint_nms_rad)
+        self.metadata.setdefault('drive_loop_used', True)
+
+    async def use_pc_loop(self):
+        """Back to the p4wrist loop's PD (the drives return to torque mode)."""
+        self.loop = 'pc'
+        self.log_event('use_pc_loop')
+
+    def drive_calibration(self):
+        found = latest_summary('drive_gain_calibration', self.is_sim)
+        if found is None:
+            raise SystemExit('The drive loop needs a gain calibration: run '
+                             'drive_gain_calibration_experiment.py and its analysis first'
+                             + (' (with --sim for simulated runs).' if self.is_sim else '.'))
+        run_dir, summary = found
+        return {'source': run_dir.name, 'k_per_unit': summary['motor_k_per_unit_nm_rad'],
+                'b_per_unit': summary['motor_b_per_unit_nms_rad'],
+                'torque_offset_works': summary.get('torque_offset_works', True)}
+
+    def _apply_drive_gains(self, k_joint, b_joint):
+        cal = self.drive_calibration()
+        self.metadata['drive_gain_calibration'] = cal['source']
+        gains = drive_gains_for_joint(self.j, k_joint, b_joint, cal)
+        for motor, g in enumerate(gains):
+            self.wrist.set_drive_gains(motor, kv=g['kv'], kp=g['kp'], kout=g['kout'], kvff=100,
+                                       timeout_s=1.0)
+        self.drive_gains = gains
+        self.log_event('drive_gains', gains=gains, k_joint=k_joint, b_joint=b_joint)
 
     def current_position_deg(self):
         if self.last_sample is not None:
@@ -1066,9 +1236,10 @@ class WristSession:
             'kd_joint_nms_rad': self.kd_joint,
             'max_torque_nm': self.max_torque_nm,
             # The CST ramp applies a torque 2 SYNC periods after the position it
-            # came from (plus the drive's current loop, not included here).
-            'loop_delay_s': 2.0 * device_config.LOOP_PERIOD_S,
+            # came from; _probe_loop_delay measures it at the start of the run.
+            'loop_delay_s': self.metadata.get('loop_delay_s', 2.0 * device_config.LOOP_PERIOD_S),
             'velocity_filter_hz': device_config.VELOCITY_FILTER_HZ,
+            'timing': self._timing_summary(),
             'device_config': device_config_snapshot(),
             'experiment_config': self.config,
             'external_sensor': self.sensor.describe(),
@@ -1083,6 +1254,38 @@ class WristSession:
         write_json(self.run_dir / f'{self.experiment}_metadata.json', metadata)
         status = 'complete' if self.completed else f'INCOMPLETE ({self.abort_reason})'
         print(f'Saved {len(self.rows)} samples to {data_path} [{status}]')
+
+
+def drive_gains_for_joint(joint, k_joint, b_joint, cal):
+    """Raw drive gains per motor that render (k_joint, b_joint) on `joint` and the
+    HOLD gains on the joints it does not share motors with.
+
+    Each puck's loop gives its motor k_m = kv * g_p * k_per_unit and b_m = kv * b_per_unit
+    (g_p = kp * kout / 100), and the joints see j2mp^T diag(k_m) j2mp, so a joint
+    j served by motors i gets sum_i T_ij^2 k_m. Motors that serve the joint under
+    test get its values (so FE and UR share them)."""
+    if not b_joint > 0:
+        raise ValueError('The drive loop needs positive damping: its velocity loop makes the torque.')
+    T = device_config.J2MP
+    names = device_config.JOINT_NAMES
+    gains = []
+    for i in range(3):
+        served = [j for j in range(3) if T[i][j] != 0.0]
+        j = joint if joint in served else served[0]
+        k = k_joint if j == joint else device_config.HOLD_KP_NM_RAD[names[j]]
+        b = b_joint if j == joint else max(device_config.HOLD_KD_NMS_RAD[names[j]], 1e-3)
+        reflect = sum(T[m][j] ** 2 for m in range(3) if T[m][j] != 0.0)
+        k_m, b_m = k / reflect, b / reflect
+        kv = b_m / cal['b_per_unit'][i]
+        g_p = k_m / (cal['k_per_unit'][i] * kv) if kv > 0 else 0.0
+        # The smallest kout that keeps kp within 16 bits gives the finest kp steps.
+        for kout in (1, 10, 100, 1000):
+            kp = int(round(g_p * 100.0 / kout))
+            if kp <= 65535:
+                break
+        gains.append({'kv': kv, 'kp': kp, 'kout': kout, 'k_motor_nm_rad': k_m, 'b_motor_nms_rad': b_m,
+                      'g_p': g_p})
+    return gains
 
 
 def _inverse_transpose(m):

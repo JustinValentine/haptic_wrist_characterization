@@ -69,7 +69,9 @@ HOLD_KD_NMS_RAD = {'PS': 0.1, 'FE': 0.1, 'UR': 0.1}
 HOLD_MAX_TORQUE_NM = 2.0
 
 # --- p4wrist loop -----------------------------------------------------------------
-LOOP_PERIOD_S = 0.002              # One SYNC per 2 ms (500 Hz), as on the WAM
+LOOP_PERIOD_S = 0.002              # One SYNC per 2 ms (500 Hz), as on the WAM. 0.001 (1 kHz)
+                                   # halves the PC loop's delay and doubles the sampling; with
+                                   # only 3 pucks the bus is ~55% loaded (drive loop: use 2 ms)
 VELOCITY_FILTER_HZ = 100.0         # Filter on differenced positions (libbarrett: 180 rad/s,
                                    # ~29 Hz). The loop's ~3 ms delay caps stable PD stiffness near
                                    # 40 N m/rad at 30 Hz and ~80 at 100 Hz (p4_sim gain scan).
@@ -79,6 +81,16 @@ REALTIME_PRIORITY = 80             # SCHED_FIFO for the loop thread (needs CAP_S
 # libbarrett-canopen notes read them), so torque = Kt x I / sqrt(2). Not yet
 # checked on this wrist: torque_calibration_experiment.py measures the truth.
 CURRENT_TORQUE_FACTOR = 1.0 / math.sqrt(2.0)
+# Measure the command-to-torque delay at the start of every run (a small torque
+# pulse; the drive's measured current shows when it arrives) and use it in the
+# analyses instead of the nominal 2 SYNC periods.
+MEASURE_LOOP_DELAY = True
+LOOP_DELAY_PROBE_NM = 0.15
+# What the pucks report about their motors (resistance, inductance, rotor
+# inertia, Kt, current limits, loop gains), saved at every hardware connect;
+# --sim runs build the simulated motors from it when it exists.
+DRIVE_PARAMS_FILE = 'data/p4wrist_drive_params.json'
+SIM_USES_DRIVE_PARAMS = True
 # Motor thermistor (0x3010:03) to deg C. Its scale is unknown, so it is not
 # used until this is set to a function of the raw reading.
 MOTOR_THERMISTOR = None

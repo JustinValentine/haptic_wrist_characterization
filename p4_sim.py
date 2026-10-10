@@ -775,3 +775,42 @@ def _transpose(A):
 
 def _inv3(A):
     return np.linalg.inv(np.array(A, dtype=float)).tolist()
+
+
+def params_from_drive_file(path, base: Optional[SimParams] = None):
+    """SimParams with the motors the pucks describe (device_config.DRIVE_PARAMS_FILE,
+    saved at every hardware connect): rotor inertia, Kt, current limit, rated
+    torque, winding resistance and inductance, and the drives' loop gains.
+    Friction, cogging and the cable stay as in base (they are not stored)."""
+    import json
+    from pathlib import Path
+    data = json.loads(Path(path).read_text())
+    info = data['drive_info']
+    p = base or SimParams()
+
+    def per_motor(key, current):
+        values = [d.get(key) for d in info]
+        if all(isinstance(v, (int, float)) and math.isfinite(v) and v > 0 for v in values):
+            return tuple(float(v) for v in values)
+        return current
+
+    p.rotor_inertia = per_motor('rotor_inertia_kgm2', p.rotor_inertia)
+    p.kt_mnm_per_a = per_motor('kt_mnm_per_a', p.kt_mnm_per_a)
+    p.peak_current_ma = per_motor('peak_current_ma', p.peak_current_ma)
+    p.rated_torque_mnm = per_motor('rated_torque_mnm', p.rated_torque_mnm)
+    resistance = [d.get('resistance_ohm') for d in info]
+    if all(isinstance(r, (int, float)) and math.isfinite(r) and r > 0 for r in resistance):
+        p.winding_resistance = float(np.mean(resistance))
+    inductance = [d.get('inductance_mh') for d in info]
+    if all(isinstance(x, (int, float)) and math.isfinite(x) and x > 0 for x in inductance):
+        p.inductance_mh = float(np.mean(inductance))
+    gains = info[0].get('gains') or {}
+    if gains.get('kp'):
+        p.drive_kp = int(gains['kp'])
+    if gains.get('kv'):
+        p.drive_kv = float(gains['kv'])
+    if gains.get('ki') is not None:
+        p.drive_ki = float(gains['ki'])
+    if data.get('counts_per_rev'):
+        p.counts_per_rev = int(data['counts_per_rev'])
+    return p
