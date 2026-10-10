@@ -102,6 +102,8 @@ Wrist::Wrist(const p4w_config& config, std::unique_ptr<CanBus> bus, bool manual_
 	if (cfg_.telemetry_divider < 0 || cfg_.telemetry_divider > 240)
 		throw std::invalid_argument("telemetry_divider must be 0-240");
 	if (!(cfg_.velocity_filter_hz > 0.0)) throw std::invalid_argument("velocity_filter_hz must be positive");
+	if (cfg_.tpdo_wait_s <= 0.0) cfg_.tpdo_wait_s = 0.6 * cfg_.period_s;
+	if (cfg_.tpdo_wait_s >= cfg_.period_s) throw std::invalid_argument("tpdo_wait_s must be shorter than period_s");
 }
 
 Wrist::~Wrist()
@@ -162,11 +164,51 @@ void Wrist::configurePuck(Master& m, int motor)
 {
 	const int node = cfg_.node[motor];
 	DriveInfo& d = drive_[motor];
+	d = DriveInfo();
 	m.upload(node, co::OD_DEVICE_TYPE, 0);  // is it there at all?
 	d.counts_per_rev = m.upload(node, co::OD_ENCODER, 1);
 	d.rated_torque_mnm = m.upload(node, co::OD_RATED_TORQUE, 0);
 	d.kt_mnm_per_a = m.upload(node, co::OD_MOTOR, 4);
 	d.peak_current_ma = m.upload(node, co::OD_MOTOR, 9);
+	// Motor model and loop gains, for the record (and the simulator). Optional:
+	// an older firmware without them must not stop the setup.
+	const auto optional = [&](uint16_t index, uint8_t sub, double scale) {
+		try {
+			return m.upload(node, index, sub) * scale;
+		} catch (const SdoError& e) {
+			if (e.abort_code == 0) throw;
+			return kNaN;
+		}
+	};
+	d.cont_current_ma = optional(co::OD_MOTOR, 8, 1.0);
+	d.resistance_ohm = optional(co::OD_MOTOR, 5, 0.01);
+	d.inductance_mh = optional(co::OD_MOTOR, 6, 0.01);
+	// 0x3011:07 is g cm^2 x 2^15; 1 g cm^2 = 1e-7 kg m^2.
+	d.rotor_inertia_kgm2 = optional(co::OD_MOTOR, 7, 1e-7 / 32768.0);
+	const auto optionalBits = [&](uint16_t index, uint8_t sub, bool* ok) -> int32_t {
+		try {
+			*ok = true;
+			return m.upload(node, index, sub);
+		} catch (const SdoError& e) {
+			if (e.abort_code == 0) throw;
+			*ok = false;
+			return 0;
+		}
+	};
+	const auto floatOf = [](int32_t bits) {
+		float f;
+		std::memcpy(&f, &bits, sizeof(f));
+		return double(f);
+	};
+	bool ok[6];
+	d.gains.kp = optionalBits(co::OD_POSITION_GAINS, 1, &ok[0]);
+	d.gains.kvff = optionalBits(co::OD_POSITION_GAINS, 2, &ok[1]);
+	d.gains.kaff = optionalBits(co::OD_POSITION_GAINS, 3, &ok[2]);
+	d.gains.kout = optionalBits(co::OD_POSITION_GAINS, 4, &ok[3]);
+	d.gains.kv = floatOf(optionalBits(co::OD_VELOCITY_GAINS, 1, &ok[4]));
+	d.gains.ki = floatOf(optionalBits(co::OD_VELOCITY_GAINS, 2, &ok[5]));
+	gains_known_[motor] = ok[0] && ok[1] && ok[2] && ok[3] && ok[4] && ok[5];
+	gains_changed_[motor] = false;
 	if (d.counts_per_rev <= 0)
 		throw std::runtime_error(format("puck %d reports %d encoder counts per turn", node, d.counts_per_rev));
 	if (d.rated_torque_mnm <= 0.0)
@@ -188,15 +230,38 @@ void Wrist::configurePuck(Master& m, int motor)
 	// controlword_refresh_cycles.
 	mapPdo(m, node, 0x1401, 0x1601, co::COB_CONTROL, 255,
 			{{co::mapEntry(co::OD_CONTROLWORD, 0, 16), true}, {co::mapEntry(co::OD_MODE, 0, 8), true}}, nullptr);
-	m.download(node, 0x1402, 1, co::PDO_COB_INVALID | (co::COB_RPDO3 + node), 4);
+	// RPDO3: position target (and torque offset) for the drive's own position
+	// loop (CSP), latched on SYNC. Only sent while the drive loop runs.
+	std::vector<bool> mapped;
+	if (cfg_.map_drive_targets) {
+		mapPdo(m, node, 0x1402, 0x1602, co::COB_RPDO3 + node, 0,
+				{{co::mapEntry(co::OD_TARGET_POSITION, 0, 32), false},
+				 {co::mapEntry(co::OD_TORQUE_OFFSET, 0, 16), false}}, &mapped);
+		d.drive_targets_mapped = mapped.size() > 0 && mapped[0];
+		d.torque_offset_mapped = d.drive_targets_mapped && mapped.size() > 1 && mapped[1];
+		if (!d.drive_targets_mapped)
+			m.download(node, 0x1402, 1, co::PDO_COB_INVALID | (co::COB_RPDO3 + node), 4);
+	} else {
+		m.download(node, 0x1402, 1, co::PDO_COB_INVALID | (co::COB_RPDO3 + node), 4);
+	}
 	m.download(node, 0x1403, 1, co::PDO_COB_INVALID | (co::COB_RPDO4 + node), 4);
 
-	// TPDO1: position (and q-axis current) on every SYNC.
+	// TPDO1 on every SYNC: position, and when the drive maps them, q-axis
+	// current (what the motor delivers) and the drive's own torque demand.
 	std::vector<std::pair<uint32_t, bool>> feedback = {{co::mapEntry(co::OD_POSITION, 0, 32), true}};
 	if (cfg_.map_current) feedback.push_back({co::mapEntry(co::OD_CURRENT, 0, 16), false});
-	std::vector<bool> mapped;
+	if (cfg_.map_torque_demand) feedback.push_back({co::mapEntry(co::OD_TORQUE_DEMAND, 0, 16), false});
+	mapped.clear();
 	mapPdo(m, node, 0x1800, 0x1A00, co::COB_TPDO1 + node, 0, feedback, &mapped);
-	d.current_mapped = mapped.size() > 1 && mapped[1];
+	int offset = 4;
+	for (size_t k = 1; k < feedback.size(); ++k) {
+		if (!mapped[k]) continue;
+		if (feedback[k].first == co::mapEntry(co::OD_CURRENT, 0, 16)) d.current_offset = offset;
+		else d.demand_offset = offset;
+		offset += 2;
+	}
+	d.current_mapped = d.current_offset >= 0;
+	d.torque_demand_mapped = d.demand_offset >= 0;
 
 	// TPDO2: statusword + mode display (the P4 sends it every 100 ms whatever
 	// the type; type 5 is libbarrett-canopen's setting).
@@ -216,7 +281,6 @@ void Wrist::configurePuck(Master& m, int motor)
 	} else {
 		m.download(node, 0x1802, 1, co::PDO_COB_INVALID | (co::COB_TPDO3 + node), 4);
 	}
-	d.motor_temp_mapped = (d.telemetry_mask & 4) != 0;
 	m.download(node, 0x1803, 1, co::PDO_COB_INVALID | (co::COB_TPDO4 + node), 4);
 
 	// Heartbeat producer. The period also marks "configured since the last
@@ -385,11 +449,23 @@ void Wrist::start()
 	sdo_next_ = 0;
 	sdo_waiting_ = false;
 	sync_loss_armed_ = cfg_.sync_loss_timeout_ms <= 0;
+	sync_loss_acks_ = 0;
 	if (cfg_.sync_loss_timeout_ms > 0) {
 		// Written once SYNC runs, from the loop: a drive whose SYNC-loss
 		// timer is set before the first SYNC may fault at once.
 		for (int i = 0; i < 3; ++i)
-			sdo_queue_.push_back({cfg_.node[i], co::OD_SYNC_LOSS_TIMEOUT, 0, uint32_t(cfg_.sync_loss_timeout_ms), 2});
+			sdo_queue_.push_back({cfg_.node[i], co::OD_SYNC_LOSS_TIMEOUT, 0, uint32_t(cfg_.sync_loss_timeout_ms), 2,
+					SDO_ARM_SYNC_LOSS});
+	}
+	{
+		std::lock_guard<std::mutex> lock(sdo_mutex_);
+		sdo_requests_.clear();
+	}
+	sdo_requested_ = sdo_completed_ = 0;
+	csp_phase_ = 0;
+	for (int i = 0; i < 3; ++i) {
+		have_demand_[i] = false;
+		torque_demand_[i] = kNaN;
 	}
 	sdo_idle_ = sdo_queue_.empty();
 	request_ = REQ_NONE;
@@ -542,10 +618,14 @@ void Wrist::clearFault()
 
 void Wrist::stop()
 {
-	if (!running_) return;
+	if (!running_) {
+		restoreGains();
+		return;
+	}
 	try {
 		const int st = sample().wrist_state;
 		if (st != P4W_STATE_DISABLED && st != P4W_STATE_FAULT) disable(1.0);
+		restoreGains();
 		if (cfg_.sync_loss_timeout_ms > 0) {
 			// Disarm SYNC-loss detection before SYNC stops, so the drives
 			// do not fault (and EMCY) as soon as the loop ends.
@@ -571,6 +651,69 @@ void Wrist::stop()
 	p4w_sample s = sample();
 	s.wrist_state = P4W_STATE_STOPPED;
 	publish(s);
+}
+
+// --- drive gains ---------------------------------------------------------------------------------
+
+std::vector<Wrist::RuntimeSdo> Wrist::gainWrites(int node, const p4w_drive_gains& g)
+{
+	const auto bits = [](double v) {
+		const float f = float(v);
+		uint32_t u;
+		std::memcpy(&u, &f, sizeof(u));
+		return u;
+	};
+	return {{node, co::OD_POSITION_GAINS, 1, uint32_t(g.kp), 2},
+	        {node, co::OD_POSITION_GAINS, 2, uint32_t(g.kvff), 2},
+	        {node, co::OD_POSITION_GAINS, 3, uint32_t(g.kaff), 2},
+	        {node, co::OD_POSITION_GAINS, 4, uint32_t(g.kout), 2},
+	        {node, co::OD_VELOCITY_GAINS, 1, bits(g.kv), 4},
+	        {node, co::OD_VELOCITY_GAINS, 2, bits(g.ki), 4}};
+}
+
+void Wrist::writeGainsDirect(int node, const p4w_drive_gains& g)
+{
+	Master m(*bus_);
+	for (const RuntimeSdo& w : gainWrites(node, g)) m.download(w.node, w.index, w.sub, w.value, w.nbytes);
+}
+
+void Wrist::setDriveGains(int motor, const p4w_drive_gains& g, double timeout_s)
+{
+	if (motor < 0 || motor > 2) throw std::invalid_argument("motor must be 0, 1 or 2");
+	for (int32_t v : {g.kp, g.kvff, g.kaff, g.kout})
+		if (v < 0 || v > 65535) throw std::invalid_argument("kp, kvff, kaff and kout are 16-bit unsigned");
+	if (!std::isfinite(g.kv) || !std::isfinite(g.ki) || g.kv < 0 || g.ki < 0)
+		throw std::invalid_argument("kv and ki must be finite and non-negative");
+	if (drive_[motor].counts_per_rev <= 0) throw std::logic_error("connect before setting drive gains");
+	const int node = cfg_.node[motor];
+	gains_changed_[motor] = true;
+	if (!running_) {
+		writeGainsDirect(node, g);
+		return;
+	}
+	std::vector<RuntimeSdo> writes = gainWrites(node, g);
+	for (RuntimeSdo& w : writes) w.caller = true;
+	uint64_t target;
+	{
+		std::lock_guard<std::mutex> lock(sdo_mutex_);
+		sdo_requests_.insert(sdo_requests_.end(), writes.begin(), writes.end());
+		target = (sdo_requested_ += writes.size());
+	}
+	if (!waitFor([&] { return sdo_completed_ >= target; }, timeout_s))
+		throw std::runtime_error(format("puck %d did not take its gains in time", node));
+	if (sample().fault == P4W_FAULT_SDO) throw std::runtime_error(faultText());
+}
+
+void Wrist::restoreGains()
+{
+	for (int i = 0; i < 3; ++i) {
+		if (!gains_changed_[i] || !gains_known_[i]) continue;
+		try {
+			setDriveGains(i, drive_[i].gains, 1.0);
+			gains_changed_[i] = false;
+		} catch (...) {
+		}
+	}
 }
 
 // --- caller <-> loop -------------------------------------------------------------------------
@@ -686,8 +829,14 @@ void Wrist::dispatch(const CanFrame& f, bool collecting, uint32_t* got)
 		// cycle behind the others; only positions answering this SYNC count.
 		if (!collecting || f.len < 4) return;
 		counts_[motor] = le32(f.data);
-		if (drive_[motor].current_mapped && f.len >= 6)
-			current_[motor] = le16(f.data + 4) / 1000.0 * drive_[motor].peak_current_ma / 1000.0;
+		if (drive_[motor].current_offset >= 0 && f.len >= drive_[motor].current_offset + 2)
+			current_[motor] = le16(f.data + drive_[motor].current_offset) / 1000.0
+					* drive_[motor].peak_current_ma / 1000.0;
+		if (drive_[motor].demand_offset >= 0 && f.len >= drive_[motor].demand_offset + 2) {
+			torque_demand_[motor] = le16(f.data + drive_[motor].demand_offset) / 1000.0
+					* drive_[motor].rated_torque_mnm / 1000.0;
+			have_demand_[motor] = true;
+		}
 		*got |= 1u << motor;
 		return;
 	case co::COB_TPDO2:
@@ -736,14 +885,14 @@ void Wrist::dispatch(const CanFrame& f, bool collecting, uint32_t* got)
 			const RuntimeSdo& r = sdo_queue_[sdo_next_];
 			if (r.node != node || !co::sdoMatches(f, r.index, r.sub)) return;
 			if (f.data[0] == 0x60) {
-				sdo_waiting_ = false;
-				++sdo_next_;
+				if (r.kind == SDO_ARM_SYNC_LOSS && ++sync_loss_acks_ >= 3) sync_loss_armed_ = true;
 			} else {
 				raise(P4W_FAULT_SDO, motor, format("puck %d refused 0x%04X:%02X (SDO reply 0x%02X)", node, r.index,
 						r.sub, f.data[0]), false, t);
-				sdo_waiting_ = false;
-				++sdo_next_;
 			}
+			if (r.caller) ++sdo_completed_;
+			sdo_waiting_ = false;
+			++sdo_next_;
 		}
 		return;
 	default:
@@ -783,6 +932,14 @@ void Wrist::supervise(double t)
 			else
 				raise(P4W_FAULT_DRIVE_DROPPED, i, format("puck %d left Operation Enabled (statusword 0x%04X)",
 						cfg_.node[i], statusword_[i]), false, t);
+		}
+	}
+	if (csp_phase_ == 2) {
+		for (int i = 0; i < 3; ++i) {
+			if (statusword_time_[i] > csp_since_ && co::swOperationEnabled(statusword_[i])
+					&& mode_display_[i] != co::MODE_CSP)
+				raise(P4W_FAULT_DRIVE_LOOP, i, format("puck %d did not enter its position loop (mode display %d)",
+						cfg_.node[i], mode_display_[i]), true, t);
 		}
 	}
 	if (!zeroed_) return;
@@ -908,6 +1065,8 @@ void Wrist::runStateMachine(double t)
 		break;
 	}
 
+	updateDriveLoop(t);
+
 	// What the drives should be doing.
 	uint16_t cw = co::CW_DISABLE_VOLTAGE;
 	int8_t mode = co::MODE_IDLE;
@@ -919,7 +1078,7 @@ void Wrist::runStateMachine(double t)
 		break;
 	case P4W_STATE_ACTIVE:
 		cw = co::CW_ENABLE_OPERATION;
-		mode = co::MODE_CST;
+		mode = csp_phase_ == 2 ? co::MODE_CSP : co::MODE_CST;
 		break;
 	case P4W_STATE_BRAKE:
 	case P4W_STATE_BRAKING:
@@ -934,6 +1093,53 @@ void Wrist::runStateMachine(double t)
 	mode_byte_ = mode;
 }
 
+void Wrist::updateDriveLoop(double t)
+{
+	const bool want = state_ == P4W_STATE_ACTIVE && got_command_since_enable_ && active_command_.drive_loop;
+	if (!want) {
+		if (csp_phase_ != 0) {
+			csp_phase_ = 0;
+			control_dirty_ = true;
+			for (int j = 0; j < 3; ++j) have_setpoint_[j] = false;   // the host PD takes over from here
+		}
+		return;
+	}
+	for (int i = 0; i < 3; ++i) {
+		if (!drive_[i].drive_targets_mapped) {
+			raise(P4W_FAULT_DRIVE_LOOP, i, format("drive loop requested, but puck %d did not accept a "
+					"position target mapping (0x607A)", cfg_.node[i]), true, t);
+			return;
+		}
+	}
+	if (csp_phase_ == 0) {
+		// Arm: stream targets equal to the current positions while still in CST,
+		// so the drive's buffered target is where the motor is when CSP engages.
+		csp_phase_ = 1;
+		csp_arm_cycles_ = 0;
+		for (int j = 0; j < 3; ++j) have_setpoint_[j] = false;
+	} else if (csp_phase_ == 1 && ++csp_arm_cycles_ >= 2) {
+		csp_phase_ = 2;
+		csp_since_ = t;
+		control_dirty_ = true;
+	}
+}
+
+double Wrist::advanceSetpoint(int j, const p4w_joint_command& c)
+{
+	if (!have_setpoint_[j]) {
+		setpoint_[j] = q_[j];
+		have_setpoint_[j] = true;
+	} else {
+		setpoint_[j] = held_setpoint_[j];
+	}
+	if (std::isfinite(c.position)) setpoint_[j] = c.position;
+	setpoint_velocity_[j] = c.velocity;
+	// Advance after use, so the error compares setpoint and position at the
+	// same instant (moteus semantics for a NaN position).
+	held_setpoint_[j] = setpoint_[j] + (std::isfinite(c.position) ? 0.0 : c.velocity * cfg_.period_s);
+	return setpoint_[j];
+}
+
 void Wrist::control(double t, Vec3* tau_joint)
 {
 	(void)t;
@@ -943,8 +1149,33 @@ void Wrist::control(double t, Vec3* tau_joint)
 		setpoint_velocity_[j] = 0.0;
 		joint_mode_[j] = 0;
 	}
+	offset_nm_ = Vec3{};
 	if (state_ != P4W_STATE_ACTIVE) {
 		for (int j = 0; j < 3; ++j) have_setpoint_[j] = false;
+		return;
+	}
+	if (csp_phase_ >= 1) {
+		// The drives render the joints: send them motor targets from the joint
+		// setpoints, and each joint's feedforward as torque offsets.
+		Vec3 ff{};
+		for (int j = 0; j < 3; ++j) {
+			const p4w_joint_command& c = active_command_.joint[j];
+			advanceSetpoint(j, c);
+			ff[j] = std::isfinite(c.torque) ? c.torque : 0.0;
+			joint_mode_[j] = P4W_MODE_DRIVE;
+		}
+		Vec3 cap{};
+		for (int i = 0; i < 3; ++i) cap[i] = cfg_.max_motor_permille * drive_[i].rated_torque_mnm / 1e6;
+		offset_nm_ = tx_.saturate(tx_.motorTorques(ff), cap);
+		const Vec3 m = tx_.motorAngles(setpoint_);
+		for (int i = 0; i < 3; ++i) {
+			if (csp_phase_ == 1) {
+				motor_target_[i] = counts_[i];
+			} else {
+				const double raw = m[i] + record_.motor_offset[i];
+				motor_target_[i] = int32_t(std::lround(cfg_.position_sign[i] * raw * drive_[i].counts_per_rev / kTwoPi));
+			}
+		}
 		return;
 	}
 	for (int j = 0; j < 3; ++j) {
@@ -964,18 +1195,8 @@ void Wrist::control(double t, Vec3* tau_joint)
 			else
 				tau = c.torque;
 		} else {
-			if (!have_setpoint_[j]) {
-				setpoint_[j] = q_[j];
-				have_setpoint_[j] = true;
-			} else {
-				setpoint_[j] = held_setpoint_[j];
-			}
-			if (std::isfinite(c.position)) setpoint_[j] = c.position;
-			setpoint_velocity_[j] = c.velocity;
+			advanceSetpoint(j, c);
 			tau = c.kp * (setpoint_[j] - q_[j]) + c.kd * (c.velocity - qd_[j]) + c.torque;
-			// Advance after use, so the error compares setpoint and position
-			// at the same instant (moteus semantics for a NaN position).
-			held_setpoint_[j] = setpoint_[j] + (std::isfinite(c.position) ? 0.0 : c.velocity * cfg_.period_s);
 			c.mode = P4W_MODE_POSITION;
 		}
 		joint_mode_[j] = c.mode;
@@ -1003,6 +1224,26 @@ void Wrist::sendTorques(const Vec3& tau_joint)
 		f.data[2 * (i + 1) + 1] = uint8_t((permille_[i] >> 8) & 0xFF);
 	}
 	send(f);
+}
+
+void Wrist::sendDriveTargets()
+{
+	if (csp_phase_ < 1) return;
+	for (int i = 0; i < 3; ++i) {
+		CanFrame f;
+		f.id = co::COB_RPDO3 + cfg_.node[i];
+		f.len = drive_[i].torque_offset_mapped ? 6 : 4;
+		const uint32_t target = uint32_t(motor_target_[i]);
+		for (int k = 0; k < 4; ++k) f.data[k] = uint8_t(target >> (8 * k));
+		if (drive_[i].torque_offset_mapped) {
+			const double pm = cfg_.torque_sign[i] * offset_nm_[i] * 1e6 / drive_[i].rated_torque_mnm;
+			const int32_t v = int32_t(std::lround(std::max(-double(cfg_.max_motor_permille),
+					std::min(double(cfg_.max_motor_permille), pm))));
+			f.data[4] = uint8_t(v & 0xFF);
+			f.data[5] = uint8_t((v >> 8) & 0xFF);
+		}
+		send(f);
+	}
 }
 
 void Wrist::cycle()
@@ -1070,10 +1311,20 @@ void Wrist::cycle()
 	t_sync_prev_ = t;
 
 	// 5. Runtime SDO writes (one at a time, never waited on).
+	{
+		std::unique_lock<std::mutex> lock(sdo_mutex_, std::defer_lock);
+		if (manual_) lock.lock();
+		if ((lock.owns_lock() || lock.try_lock()) && !sdo_requests_.empty()) {
+			sdo_queue_.insert(sdo_queue_.end(), sdo_requests_.begin(), sdo_requests_.end());
+			sdo_requests_.clear();
+			sdo_idle_ = false;
+		}
+	}
 	if (sdo_waiting_ && t - sdo_sent_at_ > kSdoTimeout_s) {
 		const RuntimeSdo& r = sdo_queue_[sdo_next_];
 		raise(P4W_FAULT_SDO, motorOfNode(r.node), format("puck %d did not answer writing 0x%04X:%02X", r.node,
 				r.index, r.sub), false, t);
+		if (r.caller) ++sdo_completed_;
 		sdo_waiting_ = false;
 		++sdo_next_;
 	}
@@ -1083,10 +1334,7 @@ void Wrist::cycle()
 		sdo_waiting_ = true;
 		sdo_sent_at_ = t;
 	}
-	if (!sdo_waiting_ && sdo_next_ >= sdo_queue_.size()) {
-		if (!sdo_queue_.empty() && sdo_queue_.back().value != 0) sync_loss_armed_ = true;
-		sdo_idle_ = true;
-	}
+	if (!sdo_waiting_ && sdo_next_ >= sdo_queue_.size()) sdo_idle_ = true;
 
 	// 6. The caller's latest command.
 	{
@@ -1109,8 +1357,9 @@ void Wrist::cycle()
 	Vec3 tau_joint{};
 	control(t, &tau_joint);
 
-	// 8. Commands out: torques (latched at the next SYNC) and the controlword.
+	// 8. Commands out: torques and drive targets (latched at the next SYNC), the controlword.
 	sendTorques(tau_joint);
+	sendDriveTargets();
 	const int refresh = state_ == P4W_STATE_ENABLING ? kEnableRefreshCycles : cfg_.controlword_refresh_cycles;
 	if (control_dirty_ || cycle_ - last_control_cycle_ >= uint64_t(refresh)) sendControl(cw_, mode_byte_);
 
@@ -1130,7 +1379,8 @@ void Wrist::cycle()
 		s.qd[k] = qd_[k];
 		s.setpoint[k] = setpoint_[k];
 		s.setpoint_velocity[k] = setpoint_velocity_[k];
-		s.tau_cmd[k] = state_ == P4W_STATE_ACTIVE ? tau_cmd_[k] : 0.0;
+		s.tau_cmd[k] = state_ != P4W_STATE_ACTIVE ? 0.0 : (csp_phase_ >= 1 ? kNaN : tau_cmd_[k]);
+		s.motor_target[k] = motor_target_[k];
 		s.tau_meas[k] = tau_meas[k];
 		s.motor_angle[k] = motor_angle_[k];
 		s.current[k] = current_[k];
@@ -1153,6 +1403,17 @@ void Wrist::cycle()
 	s.emcy_code = emcy_code_;
 	s.missed_feedback = missed_mask_;
 	s.zeroed = zeroed_ ? 1 : 0;
+	s.drive_loop = csp_phase_ == 2 ? 1 : 0;
+	{
+		bool all = true;
+		Vec3 demand{};
+		for (int i = 0; i < 3; ++i) {
+			all = all && have_demand_[i];
+			demand[i] = cfg_.torque_sign[i] * torque_demand_[i];
+		}
+		const Vec3 tau_demand = tx_.jointTorques(demand);
+		for (int k = 0; k < 3; ++k) s.tau_demand[k] = all ? tau_demand[k] : kNaN;
+	}
 	publish(s);
 	const size_t head = log_head_.load(std::memory_order_relaxed);
 	const size_t next = (head + 1) % log_.size();

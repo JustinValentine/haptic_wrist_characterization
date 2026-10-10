@@ -71,8 +71,10 @@ const char* p4w_last_error(void) { return last_error.c_str(); }
 int p4w_abi_version(void) { return P4W_ABI_VERSION; }
 
 void p4w_struct_sizes(int32_t* config, int32_t* command, int32_t* sample, int32_t* zero_cal,
-		int32_t* zero_record)
+		int32_t* zero_record, int32_t* drive_gains, int32_t* drive_info)
 {
+	*drive_gains = int32_t(sizeof(p4w_drive_gains));
+	*drive_info = int32_t(sizeof(p4w_drive_info));
 	*config = int32_t(sizeof(p4w_config));
 	*command = int32_t(sizeof(p4w_command));
 	*sample = int32_t(sizeof(p4w_sample));
@@ -105,7 +107,7 @@ void p4w_default_config(p4w_config* c)
 	c->command_timeout_s = 0.1;
 	c->brake_s = 0.5;
 	c->heartbeat_timeout_s = 1.0;
-	c->tpdo_wait_s = 0.0012;
+	c->tpdo_wait_s = 0.0;   // 0: 60% of the period
 	c->current_torque_factor = 1.0 / std::sqrt(2.0);
 	c->max_motor_permille = 1000;
 	c->sync_loss_timeout_ms = 20;
@@ -115,6 +117,8 @@ void p4w_default_config(p4w_config* c)
 	c->telemetry_divider = 50;
 	c->realtime_priority = 0;
 	c->map_current = 1;
+	c->map_torque_demand = 1;
+	c->map_drive_targets = 1;
 }
 
 p4w_wrist* p4w_open_socketcan(const p4w_config* config, const char* interface)
@@ -213,18 +217,17 @@ int p4w_fault_text(p4w_wrist* w, char* text, int32_t text_len)
 	return guard([&] { copyText(w->wrist->faultText(), text, text_len); });
 }
 
-int p4w_drive_info(p4w_wrist* w, double* rated_torque_mnm, double* kt_mnm_per_a, double* peak_current_ma,
-		int32_t* counts_per_rev)
+int p4w_get_drive_info(p4w_wrist* w, int32_t motor, p4w_drive_info* info)
 {
 	return guard([&] {
-		for (int i = 0; i < 3; ++i) {
-			const DriveInfo& d = w->wrist->driveInfo(i);
-			rated_torque_mnm[i] = d.rated_torque_mnm;
-			kt_mnm_per_a[i] = d.kt_mnm_per_a;
-			peak_current_ma[i] = d.peak_current_ma;
-			counts_per_rev[i] = d.counts_per_rev;
-		}
+		if (motor < 0 || motor > 2) throw std::invalid_argument("motor must be 0, 1 or 2");
+		*info = w->wrist->driveInfo(motor);
 	});
+}
+
+int p4w_set_drive_gains(p4w_wrist* w, int32_t motor, const p4w_drive_gains* gains, double timeout_s)
+{
+	return guard([&] { w->wrist->setDriveGains(motor, *gains, timeout_s); });
 }
 
 }  // extern "C"

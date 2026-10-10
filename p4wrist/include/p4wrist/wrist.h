@@ -28,14 +28,11 @@ int withinTurn(int counts, int cpr);
 // +1, -1 or 0 (ambiguous) from a motion's counter and single-turn deltas.
 int singleTurnDirection(int position_delta, int single_turn_delta, int cpr);
 
-struct DriveInfo {
-	double rated_torque_mnm = 0.0;
-	double kt_mnm_per_a = 0.0;
-	double peak_current_ma = 0.0;
-	int counts_per_rev = 0;
-	bool current_mapped = false;
-	bool motor_temp_mapped = false;
-	uint32_t telemetry_mask = 0;  // TPDO3 entries mapped: bus voltage, amp temp, motor temp
+// What a puck reports about itself, plus where the position TPDO carries what.
+struct DriveInfo : p4w_drive_info {
+	DriveInfo() : p4w_drive_info{} {}
+	int current_offset = -1;   // byte offsets in TPDO1 (-1: not mapped)
+	int demand_offset = -1;
 };
 
 class Wrist {
@@ -52,6 +49,7 @@ public:
 	Vec3 zero(const p4w_zero_cal& cal, bool exact);  // returns offsets from home
 	p4w_zero_record zeroRecord() const { return record_; }
 	const DriveInfo& driveInfo(int motor) const { return drive_[motor]; }
+	void setDriveGains(int motor, const p4w_drive_gains& gains, double timeout_s);
 
 	// --- loop -------------------------------------------------------------------
 	void start();
@@ -73,13 +71,22 @@ private:
 		p4w_sample sample{};
 		char fault_text[256] = {};
 	};
+	enum SdoKind { SDO_PLAIN, SDO_ARM_SYNC_LOSS };
 	struct RuntimeSdo {
 		int node;
 		uint16_t index;
 		uint8_t sub;
 		uint32_t value;
 		int nbytes;
+		int kind = SDO_PLAIN;
+		bool caller = false;   // requested through setDriveGains (counted in sdo_completed_)
 	};
+	void restoreGains();
+	static std::vector<RuntimeSdo> gainWrites(int node, const p4w_drive_gains& g);
+	void writeGainsDirect(int node, const p4w_drive_gains& g);
+	void updateDriveLoop(double t);
+	double advanceSetpoint(int j, const p4w_joint_command& c);
+	void sendDriveTargets();
 	enum Request { REQ_NONE = 0, REQ_ENABLE, REQ_DISABLE, REQ_CLEAR, REQ_QUIESCE };
 	enum EnablePhase { EN_FAULT_RESET, EN_SHUTDOWN, EN_OPERATION };
 
@@ -138,6 +145,7 @@ private:
 	double late_s_ = 0.0;
 
 	int32_t counts_[3] = {};
+	bool have_demand_[3] = {};
 	double current_[3] = {};
 	bool have_feedback_[3] = {};
 	int missed_[3] = {};
@@ -160,7 +168,22 @@ private:
 	bool sdo_waiting_ = false;
 	double sdo_sent_at_ = 0.0;
 	bool sync_loss_armed_ = false;
+	int sync_loss_acks_ = 0;
 	std::atomic<bool> sdo_idle_{true};
+	// SDO writes requested by the caller while the loop runs.
+	std::mutex sdo_mutex_;
+	std::vector<RuntimeSdo> sdo_requests_;
+	std::atomic<uint64_t> sdo_requested_{0}, sdo_completed_{0};
+	bool gains_changed_[3] = {};
+	bool gains_known_[3] = {};
+
+	// Drive loop (CSP): 0 off, 1 arming (targets = current position, still CST), 2 on.
+	int csp_phase_ = 0;
+	int csp_arm_cycles_ = 0;
+	double csp_since_ = 0.0;
+	int32_t motor_target_[3] = {};
+	Vec3 offset_nm_{};               // drive torque offsets (motor N m, drive frame)
+	double torque_demand_[3] = {};   // drive's torque demand (motor N m, drive frame)
 
 	// Caller <-> loop.
 	mutable std::mutex command_mutex_;

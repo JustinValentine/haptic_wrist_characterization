@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define P4W_JOINTS 3
-#define P4W_ABI_VERSION 1
+#define P4W_ABI_VERSION 2
 
 enum { P4W_PS = 0, P4W_FE = 1, P4W_UR = 2 };
 
@@ -39,6 +39,7 @@ enum {
 
 /* Per-joint command modes. Numbering follows moteus so logs read alike. */
 enum {
+	P4W_MODE_DRIVE = 8,         /* (reported) the drives' own position loops render this joint */
 	P4W_MODE_POSITION = 10,     /* PD about a setpoint plus feedforward */
 	P4W_MODE_STAY_WITHIN = 13   /* feedforward inside [lower, upper], PD to a violated bound */
 };
@@ -57,7 +58,8 @@ enum {
 	P4W_FAULT_ENABLE_TIMEOUT = 9,
 	P4W_FAULT_BUS = 10,             /* CAN send failed */
 	P4W_FAULT_SDO = 11,             /* a runtime SDO write failed */
-	P4W_FAULT_OVERRUN = 12          /* the loop missed overrun_limit_cycles in a row */
+	P4W_FAULT_OVERRUN = 12,         /* the loop missed overrun_limit_cycles in a row */
+	P4W_FAULT_DRIVE_LOOP = 13       /* drive loop requested but a puck cannot take position targets */
 };
 
 typedef struct {
@@ -86,6 +88,8 @@ typedef struct {
 	int32_t telemetry_divider;          /* TPDO3 (bus voltage, temperatures) every n SYNCs */
 	int32_t realtime_priority;          /* SCHED_FIFO priority of the loop thread; 0 = none */
 	int32_t map_current;                /* 1: put q-axis current (0x6078) in the position TPDO */
+	int32_t map_torque_demand;          /* 1: also put the drive's torque demand (0x6074) there */
+	int32_t map_drive_targets;          /* 1: map position targets (RPDO3) so the drive loop can run */
 } p4w_config;
 
 typedef struct {
@@ -106,6 +110,14 @@ typedef struct {
 	double t_host;       /* host timestamp, echoed in samples */
 	uint32_t seq;        /* echoed in samples; set by p4w_set_command if 0 */
 	int32_t brake;       /* 1: drives in IDLE (phases grounded) instead of torque control */
+	/* 1: the drives' own position loops (CSP, gains from p4w_set_drive_gains)
+	   render every joint about its setpoint, at the drive's control rate, with
+	   each joint's feedforward torque added as the drive's torque offset. kp,
+	   kd, max_torque and stay-within bounds are then not used. Each puck closes
+	   its loop on its own motor, so joint stiffness is j2mp^T K_motor j2mp:
+	   FE and UR get N1^2 (k7 + k8) each, coupled by N1^2 (k7 - k8). */
+	int32_t drive_loop;
+	int32_t reserved;
 } p4w_command;
 
 /* One control cycle. */
@@ -137,6 +149,10 @@ typedef struct {
 	uint32_t command_seq;
 	uint32_t missed_feedback;           /* bit i: motor i missed its position this cycle */
 	int32_t zeroed;
+	int32_t drive_loop;                 /* 1 while the drives' position loops are rendering */
+	double tau_demand[P4W_JOINTS];      /* joint torque from the drives' own torque demands (0x6074;
+	                                       NaN if unmapped): what the drive asked its current loop for */
+	int32_t motor_target[P4W_JOINTS];   /* position targets sent to the drives (counts), drive loop */
 	int32_t reserved;
 } p4w_sample;
 
@@ -160,6 +176,38 @@ typedef struct {
 	int32_t reserved;
 } p4w_zero_record;
 
+/* The P4's onboard position (0x2382) and velocity (0x2381) loop gains, raw:
+   velocity demand = (kp * kout / 100) * position error + kvff * velocity target / 100
+   + kaff * acceleration target, torque demand = kv * velocity error + ki * its
+   integral. Their units are not documented; drive_gain_calibration_experiment.py
+   measures what they render. */
+typedef struct {
+	double kv;           /* 0x2381:01, float */
+	double ki;           /* 0x2381:02, float */
+	int32_t kp;          /* 0x2382:01, 0-65535 */
+	int32_t kvff;        /* 0x2382:02 */
+	int32_t kaff;        /* 0x2382:03 */
+	int32_t kout;        /* 0x2382:04, 100 = 1.0 */
+} p4w_drive_gains;
+
+/* What a puck reports about its drive and motor (read at connect). */
+typedef struct {
+	double rated_torque_mnm;     /* 0x6076 */
+	double kt_mnm_per_a;         /* 0x3011:04 */
+	double peak_current_ma;      /* 0x3011:09 */
+	double cont_current_ma;      /* 0x3011:08 */
+	double resistance_ohm;       /* 0x3011:05 (0.01 ohm units); NaN if not readable */
+	double inductance_mh;        /* 0x3011:06 (0.01 mH units) */
+	double rotor_inertia_kgm2;   /* 0x3011:07 (g cm^2 x 2^15 units) */
+	p4w_drive_gains gains;       /* the drive's gains at connect (restored at stop) */
+	int32_t counts_per_rev;      /* 0x3013:01 */
+	int32_t current_mapped;      /* the position TPDO carries q-axis current */
+	int32_t torque_demand_mapped;
+	int32_t drive_targets_mapped;   /* RPDO3 carries position targets: the drive loop can run */
+	int32_t torque_offset_mapped;   /* RPDO3 also carries the torque offset (0x60B2) */
+	int32_t telemetry_mask;      /* TPDO3: bit 0 bus voltage, 1 amplifier temp, 2 motor temp */
+} p4w_drive_info;
+
 /* A bus supplied by the caller, e.g. emulated pucks in Python. send returns 0
    on success; recv returns 1 and fills the frame if one is waiting, else 0.
    The bus is synchronous: replies to a frame are available as soon as send
@@ -174,7 +222,7 @@ const char* p4w_last_error(void);
 int p4w_abi_version(void);
 /* sizeof the structs above, for bindings to check their mirrors. */
 void p4w_struct_sizes(int32_t* config, int32_t* command, int32_t* sample,
-		int32_t* zero_cal, int32_t* zero_record);
+		int32_t* zero_cal, int32_t* zero_record, int32_t* drive_gains, int32_t* drive_info);
 
 void p4w_default_config(p4w_config* config);
 
@@ -230,9 +278,12 @@ int32_t p4w_read_log(p4w_wrist* w, p4w_sample* out, int32_t max, uint32_t* dropp
 
 /* Describe the latched fault (empty if none). */
 int p4w_fault_text(p4w_wrist* w, char* text, int32_t text_len);
-/* Drive parameters read at connect, per motor. */
-int p4w_drive_info(p4w_wrist* w, double* rated_torque_mnm, double* kt_mnm_per_a,
-		double* peak_current_ma, int32_t* counts_per_rev);
+/* Drive and motor parameters read at connect (motor 0-2). */
+int p4w_get_drive_info(p4w_wrist* w, int32_t motor, p4w_drive_info* info);
+/* Set one drive's position/velocity loop gains (RAM only; the gains read at
+   connect are restored by p4w_stop). While the loop runs the writes go through
+   its non-blocking SDO queue; this call waits (or steps) up to timeout_s. */
+int p4w_set_drive_gains(p4w_wrist* w, int32_t motor, const p4w_drive_gains* gains, double timeout_s);
 
 #ifdef __cplusplus
 }

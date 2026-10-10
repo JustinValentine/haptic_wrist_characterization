@@ -30,6 +30,7 @@ ILM50 motors, not datasheet values.
 """
 import collections
 import math
+import struct
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Optional
 
@@ -45,7 +46,15 @@ DEFAULT_J2MP = ((-N2, 0.0, 0.0), (0.0, N1, N1), (0.0, -N1, N1))
 JOINTS = ('PS', 'FE', 'UR')
 CURRENT_TORQUE_FACTOR = 1.0 / math.sqrt(2.0)   # same convention as p4wrist's default
 
-DRIVE_OFF, DRIVE_TORQUE, DRIVE_BRAKE = 0, 1, 2
+DRIVE_OFF, DRIVE_TORQUE, DRIVE_BRAKE, DRIVE_LAW = 0, 1, 2, 3   # LAW: the drive's position loop (CSP)
+
+
+def float_bits(x):
+    return struct.unpack('<I', struct.pack('<f', float(x)))[0]
+
+
+def bits_float(u):
+    return struct.unpack('<f', struct.pack('<I', int(u) & 0xFFFFFFFF))[0]
 
 
 def _three(x):
@@ -93,6 +102,20 @@ class SimParams:
     drive_dir: object = (1, 1, 1)
     current_mappable: bool = True
     motor_temp_mappable: bool = True
+    torque_demand_mappable: bool = True
+    targets_mappable: bool = True           # 0x607A in an RPDO (needed by the drive loop)
+    torque_offset_in_csp: bool = True       # does 0x60B2 add to the CSP torque demand? (unverified)
+    inductance_mh: float = 0.5              # 0x3011:06 (placeholder)
+    # The drive's own loops (P4 DevKit defaults). The cascade follows the manual
+    # (position P -> velocity PI -> torque); the UNITS are this emulator's
+    # assumption: position error in counts, velocity in counts/s, torque demand
+    # in per mille of rated torque. drive_gain_calibration_experiment.py measures
+    # what real gains render, so nothing downstream depends on this choice.
+    drive_kp: int = 100
+    drive_kv: float = 0.00117
+    drive_ki: float = 1.16e-5
+    drive_velocity_filter_hz: float = 200.0
+    drive_control_hz: float = 20000.0
     substeps: int = 20
     seed: int = 0
 
@@ -171,7 +194,9 @@ class WristPlant:
         return [qt[j] - self.qt_offset[j] for j in range(3)]
 
     # --- integration -----------------------------------------------------------
-    def advance(self, dt, tau_start, tau_end, modes):
+    def advance(self, dt, tau_start, tau_end, modes, laws=None):
+        """laws[i], for motors in DRIVE_LAW, is the drive's control law:
+        law(frac, h, motor_angle, motor_velocity) -> torque (plant frame)."""
         p = self.p
         if dt <= 0:
             return list(self.m)
@@ -216,17 +241,19 @@ class WristPlant:
             for i in range(3):
                 if modes[i] == DRIVE_TORQUE:
                     cmd = tau_start[i] + (tau_end[i] - tau_start[i]) * frac
+                elif modes[i] == DRIVE_LAW:
+                    cmd = laws[i](frac, h, m[i], wm[i])
                 else:
                     cmd = 0.0
                 tau_act[i] += alpha * (cmd - tau_act[i])
                 tau = tau_act[i]
-                if modes[i] == DRIVE_TORQUE and tau * wm[i] > 0.0:
+                if modes[i] in (DRIVE_TORQUE, DRIVE_LAW) and tau * wm[i] > 0.0:
                     # Back-EMF: the supply runs out of voltage as speed rises.
                     stall = V / R * kt[i] if R > 0 else math.inf
                     avail = max(0.0, stall * (1.0 - abs(wm[i]) * ke / V))
                     if abs(tau) > avail:
                         tau = math.copysign(avail, tau)
-                if modes[i] != DRIVE_TORQUE:
+                if modes[i] not in (DRIVE_TORQUE, DRIVE_LAW):
                     tau_act[i] = 0.0
                     tau = -b_brake * wm[i] if modes[i] == DRIVE_BRAKE else 0.0
                 else:
@@ -338,8 +365,8 @@ class WristPlant:
 class SimP4(MockP4):
     """MockP4 plus physics and the firmware behaviour the library relies on."""
 
-    MAPPABLE_RX = {0x6040, 0x6060, 0x6071, 0x60FF, 0x607A}
-    MAPPABLE_TX = {0x6041, 0x6061, 0x6064, 0x606C, 0x6078, (0x3000, 1), (0x3000, 2), (0x3010, 3)}
+    MAPPABLE_RX = {0x6040, 0x6060, 0x6071, 0x60FF, 0x607A, 0x60B2}
+    MAPPABLE_TX = {0x6041, 0x6061, 0x6064, 0x606C, 0x6074, 0x6078, (0x3000, 1), (0x3000, 2), (0x3010, 3)}
 
     def __init__(self, node, motor, params: SimParams, bus):
         self.node_id = node
@@ -364,6 +391,23 @@ class SimP4(MockP4):
         od[(0x3010, 3)] = int(round(p.ambient_temperature))
         od[OD.BUS_VOLTAGE.addr] = int(round(p.bus_voltage * 10))
         od[OD.TEMPERATURE.addr] = int(round(p.ambient_temperature))
+        # Motor model, as a puck stores it.
+        od[(0x3011, 5)] = int(round(p.winding_resistance * 100))             # 0.01 ohm
+        od[(0x3011, 6)] = int(round(p.inductance_mh * 100))                  # 0.01 mH
+        od[(0x3011, 7)] = int(round(p.arr('rotor_inertia')[i] * 1e7 * 32768))  # g cm^2 x 2^15
+        od[(0x3011, 8)] = int(round(p.arr('peak_current_ma')[i] / 3))
+        # The drive's own loops.
+        od[(0x2382, 1)] = p.drive_kp
+        od[(0x2382, 2)] = 0
+        od[(0x2382, 3)] = 0
+        od[(0x2382, 4)] = 100
+        od[(0x2381, 1)] = float_bits(p.drive_kv)
+        od[(0x2381, 2)] = float_bits(p.drive_ki)
+        od[(0x2100, 1)] = int(p.drive_velocity_filter_hz)
+        od[(0x607A, 0)] = 0
+        od[(0x60B2, 0)] = 0
+        self.law_state = None
+        self.law_torque = 0.0
         for slot in range(4):   # factory transmission types, none invalid
             od[(0x1800 + slot, 2)] = od.get((0x1800 + slot, 2), 0)
         self.counter_origin = self.angle
@@ -382,12 +426,17 @@ class SimP4(MockP4):
         od[OD.ACTUAL_POSITION.addr] = int(math.floor((self.angle - self.counter_origin) * cpr / TWO_PI + 0.5))
         st = p.arr('single_turn_offset')[self.motor] + _three(p.single_turn_dir)[self.motor] * self.angle * cpr / TWO_PI
         od[OD.RAW_ENCODER.addr] = int(math.floor(st + 0.5)) % cpr
-        applied = self.ramp[1]   # torque now: where the ramp in progress (or just finished) ends
+        if self.ramp_mode == DRIVE_LAW:
+            applied = self.law_torque
+        elif self.ramp_mode == DRIVE_TORQUE:
+            applied = self.ramp[1]   # where the ramp in progress (or just finished) ends
+        else:
+            applied = 0.0
         kt = p.kt_si()[self.motor]
         peak = p.arr('peak_current_ma')[self.motor] / 1000.0
-        od[OD.ACTUAL_CURRENT.addr] = int(round(applied / kt / peak * 1000.0)) if self.ramp_mode == DRIVE_TORQUE else 0
+        od[OD.ACTUAL_CURRENT.addr] = int(round(applied / kt / peak * 1000.0))
         rated = p.arr('rated_torque_mnm')[self.motor] / 1000.0
-        od[OD.TORQUE_DEMAND.addr] = int(round(applied / rated * 1000.0)) if self.ramp_mode == DRIVE_TORQUE else 0
+        od[OD.TORQUE_DEMAND.addr] = int(round(applied / rated * 1000.0))
         plant = self.bus.plant
         od[(0x3010, 3)] = int(round(plant.temp_motor[self.motor]))
         od[OD.TEMPERATURE.addr] = int(round(plant.temp_board[self.motor]))
@@ -452,6 +501,10 @@ class SimP4(MockP4):
             ok = dummy or index in allowed or (index, sub) in allowed
             if index == 0x6078 and not self.params.current_mappable:
                 ok = False
+            if index == 0x6074 and not self.params.torque_demand_mappable:
+                ok = False
+            if index == 0x607A and not self.params.targets_mappable:
+                ok = False
             if (index, sub) == (0x3010, 3) and not self.params.motor_temp_mappable:
                 ok = False
             if not ok:
@@ -515,13 +568,73 @@ class SimP4(MockP4):
             limit = p.arr('peak_current_ma')[i] / 1000.0 * p.kt_si()[i]
             target = max(-limit, min(limit, target))
             mode = DRIVE_TORQUE
+        elif self.operation_enabled and mode_display == 8:
+            self._start_law_period()
+            self.ramp_mode = DRIVE_LAW
+            return
         elif self.operation_enabled and mode_display == 0:
             mode, target = DRIVE_BRAKE, 0.0
         else:
             mode, target = DRIVE_OFF, 0.0
-        start = self.ramp[1] if (mode == DRIVE_TORQUE and self.ramp_mode == DRIVE_TORQUE) else 0.0
+        if mode == DRIVE_TORQUE and self.ramp_mode == DRIVE_TORQUE:
+            start = self.ramp[1]
+        elif mode == DRIVE_TORQUE and self.ramp_mode == DRIVE_LAW:
+            start = self.law_torque
+        else:
+            start = 0.0
         self.ramp = (start, target)
         self.ramp_mode = mode
+        self.law_state = None
+
+    # --- the drive's position loop (CSP) -------------------------------------------
+    def _counts(self):
+        cpr = self.params.counts_per_rev
+        return (self.angle - self.counter_origin) * cpr / TWO_PI
+
+    def _start_law_period(self):
+        """At a SYNC in CSP: the new target is reached by linear interpolation
+        over the coming period (manual, Cyclic Synchronous Position)."""
+        od = self.od
+        new = float(od[(0x607A, 0)])
+        st = self.law_state
+        if st is None:
+            here = math.floor(self._counts() + 0.5)
+            st = self.law_state = {'target': here, 'counts': here, 'v_est': 0.0, 'integral': 0.0,
+                                   'since': 1.0}
+        st['from'] = st['target']
+        st['to'] = new
+        st['target'] = new
+        st['period'] = self.bus.period()
+
+    def law(self, frac, h, plant_angle, plant_velocity):
+        """Position P -> velocity PI -> torque, run at the drive's control rate."""
+        p, od, st = self.params, self.od, self.law_state
+        d = _three(p.drive_dir)[self.motor]
+        st['since'] += h
+        if st['since'] >= 1.0 / p.drive_control_hz - 1e-12:
+            dt = st['since']
+            st['since'] = 0.0
+            cpr = p.counts_per_rev
+            counts = math.floor((d * plant_angle - self.counter_origin) * cpr / TWO_PI + 0.5)
+            raw = (counts - st['counts']) / dt
+            st['counts'] = counts
+            fc = od[(0x2100, 1)] or 0
+            alpha = 1.0 - math.exp(-TWO_PI * fc * dt) if fc > 0 else 1.0
+            st['v_est'] += alpha * (raw - st['v_est'])
+            target = st['from'] + (st['to'] - st['from']) * frac
+            v_target = (st['to'] - st['from']) / st['period']
+            kp, kvff, kout = od[(0x2382, 1)], od[(0x2382, 2)], od[(0x2382, 4)]
+            kv, ki = bits_float(od[(0x2381, 1)]), bits_float(od[(0x2381, 2)])
+            v_dem = kp * kout / 100.0 * (target - counts) + kvff / 100.0 * v_target
+            err = v_dem - st['v_est']
+            st['integral'] += err * dt
+            permille = kv * err + ki * st['integral']
+            if p.torque_offset_in_csp:
+                permille += od[(0x60B2, 0)] if od[(0x60B2, 0)] < 0x8000 else od[(0x60B2, 0)] - 0x10000
+            rated = p.arr('rated_torque_mnm')[self.motor] / 1000.0
+            limit = p.arr('peak_current_ma')[self.motor] / 1000.0 * p.kt_si()[self.motor]
+            self.law_torque = max(-limit, min(limit, permille / 1000.0 * rated))
+        return d * self.law_torque
 
     def drive_input(self):
         """(start, end, mode) for the plant over the coming period, plant frame."""
@@ -533,6 +646,8 @@ class SimP4(MockP4):
     def hold_torque(self):
         """When SYNC stops, the drive keeps its last target."""
         self.ramp = (self.ramp[1], self.ramp[1])
+        if self.law_state is not None:
+            self.law_state['from'] = self.law_state['to']
 
     def sync_lost(self):
         self.trigger_fault(0x8180)
@@ -578,13 +693,14 @@ class SimBus:
             self.rx.append(puck.outbox.pop(0))
 
     def _advance(self, dt):
-        starts, ends, modes = [], [], []
+        starts, ends, modes, laws = [], [], [], []
         for puck in self.pucks:
             s, e, m = puck.drive_input()
             starts.append(s)
             ends.append(e)
             modes.append(m)
-        angles = self.plant.advance(dt, starts, ends, modes)
+            laws.append(puck.law if m == DRIVE_LAW else None)
+        angles = self.plant.advance(dt, starts, ends, modes, laws)
         d = _three(self.plant.p.drive_dir)
         for i, puck in enumerate(self.pucks):
             puck.angle = d[i] * angles[i]

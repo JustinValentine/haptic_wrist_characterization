@@ -66,8 +66,14 @@ constexpr uint16_t OD_TARGET_TORQUE = 0x6071;
 constexpr uint16_t OD_RATED_TORQUE = 0x6076;
 constexpr uint16_t OD_CURRENT = 0x6078;        // q-axis, per mille of peak current
 constexpr uint16_t OD_INTERP_PERIOD = 0x60C2;
+constexpr uint16_t OD_TORQUE_DEMAND = 0x6074;   // per mille of rated torque
+constexpr uint16_t OD_TARGET_POSITION = 0x607A; // counts, CSP
+constexpr uint16_t OD_TORQUE_OFFSET = 0x60B2;   // per mille of rated torque, added to the demand
+constexpr uint16_t OD_POSITION_GAINS = 0x2382;  // :1 Kp, :2 Kvff, :3 Kaff, :4 Kout (U16)
+constexpr uint16_t OD_VELOCITY_GAINS = 0x2381;  // :1 Kp, :2 Ki (float bits)
 
 constexpr int8_t MODE_IDLE = 0;   // current loop off, phases grounded
+constexpr int8_t MODE_CSP = 8;
 constexpr int8_t MODE_CST = 10;
 
 constexpr uint16_t CW_DISABLE_VOLTAGE = 0x0000;

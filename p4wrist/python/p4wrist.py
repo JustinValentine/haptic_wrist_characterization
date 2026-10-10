@@ -30,11 +30,12 @@ STATE_STOPPED, STATE_DISABLED, STATE_ENABLING, STATE_ACTIVE = 0, 1, 2, 3
 STATE_BRAKE, STATE_BRAKING, STATE_DISABLING, STATE_FAULT = 4, 5, 6, 7
 STATE_NAMES = {0: 'stopped', 1: 'disabled', 2: 'enabling', 3: 'active', 4: 'brake',
                5: 'braking', 6: 'disabling', 7: 'fault'}
-MODE_POSITION, MODE_STAY_WITHIN = 10, 13
+MODE_DRIVE, MODE_POSITION, MODE_STAY_WITHIN = 8, 10, 13
 
 FAULT_NAMES = {0: 'none', 1: 'position limit', 2: 'velocity limit', 3: 'host timeout',
                4: 'feedback lost', 5: 'drive fault', 6: 'puck reset', 7: 'heartbeat lost',
-               8: 'drive dropped out', 9: 'enable timeout', 10: 'CAN bus', 11: 'SDO', 12: 'overrun'}
+               8: 'drive dropped out', 9: 'enable timeout', 10: 'CAN bus', 11: 'SDO', 12: 'overrun',
+               13: 'drive loop'}
 
 D3 = C.c_double * 3
 I3 = C.c_int32 * 3
@@ -66,6 +67,8 @@ class Config(C.Structure):
         ('telemetry_divider', C.c_int32),
         ('realtime_priority', C.c_int32),
         ('map_current', C.c_int32),
+        ('map_torque_demand', C.c_int32),
+        ('map_drive_targets', C.c_int32),
     ]
 
     def to_dict(self):
@@ -89,7 +92,7 @@ class JointCommand(C.Structure):
 
 class Command(C.Structure):
     _fields_ = [('joint', JointCommand * 3), ('t_host', C.c_double), ('seq', C.c_uint32),
-                ('brake', C.c_int32)]
+                ('brake', C.c_int32), ('drive_loop', C.c_int32), ('reserved', C.c_int32)]
 
 
 class Sample(C.Structure):
@@ -110,8 +113,37 @@ class Sample(C.Structure):
         ('command_seq', C.c_uint32),
         ('missed_feedback', C.c_uint32),
         ('zeroed', C.c_int32),
+        ('drive_loop', C.c_int32),
+        ('tau_demand', D3),
+        ('motor_target', I3),
         ('reserved', C.c_int32),
     ]
+
+
+class DriveGains(C.Structure):
+    """Raw P4 position/velocity loop gains (units undocumented; see p4wrist.h)."""
+    _fields_ = [('kv', C.c_double), ('ki', C.c_double), ('kp', C.c_int32), ('kvff', C.c_int32),
+                ('kaff', C.c_int32), ('kout', C.c_int32)]
+
+    def to_dict(self):
+        return {name: getattr(self, name) for name, _ in self._fields_}
+
+
+class DriveInfo(C.Structure):
+    _fields_ = [('rated_torque_mnm', C.c_double), ('kt_mnm_per_a', C.c_double),
+                ('peak_current_ma', C.c_double), ('cont_current_ma', C.c_double),
+                ('resistance_ohm', C.c_double), ('inductance_mh', C.c_double),
+                ('rotor_inertia_kgm2', C.c_double), ('gains', DriveGains),
+                ('counts_per_rev', C.c_int32), ('current_mapped', C.c_int32),
+                ('torque_demand_mapped', C.c_int32), ('drive_targets_mapped', C.c_int32),
+                ('torque_offset_mapped', C.c_int32), ('telemetry_mask', C.c_int32)]
+
+    def to_dict(self):
+        out = {}
+        for name, _ in self._fields_:
+            value = getattr(self, name)
+            out[name] = value.to_dict() if name == 'gains' else value
+        return out
 
 
 class ZeroCal(C.Structure):
@@ -157,7 +189,7 @@ def lib():
     P = C.c_void_p
     L.p4w_last_error.restype = C.c_char_p
     L.p4w_abi_version.restype = C.c_int
-    L.p4w_struct_sizes.argtypes = [C.POINTER(C.c_int32)] * 5
+    L.p4w_struct_sizes.argtypes = [C.POINTER(C.c_int32)] * 7
     L.p4w_default_config.argtypes = [C.POINTER(Config)]
     L.p4w_open_socketcan.argtypes = [C.POINTER(Config), C.c_char_p]
     L.p4w_open_socketcan.restype = P
@@ -183,13 +215,15 @@ def lib():
     L.p4w_read_log.argtypes = [P, C.POINTER(Sample), C.c_int32, C.POINTER(C.c_uint32)]
     L.p4w_read_log.restype = C.c_int32
     L.p4w_fault_text.argtypes = [P, C.c_char_p, C.c_int32]
-    L.p4w_drive_info.argtypes = [P, D3, D3, D3, I3]
+    L.p4w_get_drive_info.argtypes = [P, C.c_int32, C.POINTER(DriveInfo)]
+    L.p4w_set_drive_gains.argtypes = [P, C.c_int32, C.POINTER(DriveGains), C.c_double]
 
-    if L.p4w_abi_version() != 1:
+    if L.p4w_abi_version() != 2:
         raise P4WristError('libp4wrist ABI version mismatch; rebuild the library')
-    sizes = [C.c_int32() for _ in range(5)]
+    sizes = [C.c_int32() for _ in range(7)]
     L.p4w_struct_sizes(*[C.byref(s) for s in sizes])
-    for (struct, size) in zip((Config, Command, Sample, ZeroCal, ZeroRecord), sizes):
+    for (struct, size) in zip((Config, Command, Sample, ZeroCal, ZeroRecord, DriveGains, DriveInfo),
+                              sizes):
         if C.sizeof(struct) != size.value:
             raise P4WristError(f'{struct.__name__} is {C.sizeof(struct)} bytes here but '
                                f'{size.value} in libp4wrist; the binding and header disagree')
@@ -370,10 +404,18 @@ class Wrist:
         return r
 
     def drive_info(self):
-        rated, kt, peak, cpr = D3(), D3(), D3(), I3()
-        self._check(lib().p4w_drive_info(self._h, rated, kt, peak, cpr))
-        return [{'rated_torque_mnm': rated[i], 'kt_mnm_per_a': kt[i],
-                 'peak_current_ma': peak[i], 'counts_per_rev': cpr[i]} for i in range(3)]
+        """Per motor: drive and motor parameters, gains at connect, what got mapped."""
+        out = []
+        for motor in range(3):
+            info = DriveInfo()
+            self._check(lib().p4w_get_drive_info(self._h, motor, C.byref(info)))
+            out.append(info.to_dict())
+        return out
+
+    def set_drive_gains(self, motor, kv, kp, ki=0.0, kvff=0, kaff=0, kout=100, timeout_s=1.0):
+        """Raw gains of one drive's position/velocity loops (restored at stop)."""
+        gains = DriveGains(float(kv), float(ki), int(kp), int(kvff), int(kaff), int(kout))
+        self._check(lib().p4w_set_drive_gains(self._h, int(motor), C.byref(gains), float(timeout_s)))
 
     # --- loop -------------------------------------------------------------------
     def start(self):

@@ -76,23 +76,38 @@ class SetupTest(unittest.TestCase):
             self.assertEqual(od[(0x1601, 1)], 0x60400010)
             self.assertEqual(od[(0x1401, 1)], 0x28A)                    # controlword broadcast
             self.assertEqual(od[(0x1401, 2)], 255)
-            self.assertEqual(od[(0x1A00, 1)], 0x60640020)               # position ...
-            self.assertEqual(od[(0x1A00, 2)], 0x60780010)               # ... and q current
+            self.assertEqual(od[(0x1A00, 1)], 0x60640020)               # position,
+            self.assertEqual(od[(0x1A00, 2)], 0x60780010)               # q current,
+            self.assertEqual(od[(0x1A00, 3)], 0x60740010)               # torque demand
             self.assertEqual(od[(0x1800, 1)], 0x180 + puck.id)
+            self.assertEqual(od[(0x1402, 1)], 0x400 + puck.id)          # drive-loop targets
+            self.assertEqual(od[(0x1602, 1)], 0x607A0020)
+            self.assertEqual(od[(0x1602, 2)], 0x60B20010)               # + torque offset
             self.assertEqual(od[(0x1017, 0)], 250)
             self.assertEqual(od[(0x1006, 0)], 2000)
-            self.assertTrue(od[(0x1402, 1)] & 0x80000000)               # unused PDOs off
+            self.assertTrue(od[(0x1403, 1)] & 0x80000000)               # unused PDOs off
             self.assertTrue(od[(0x1803, 1)] & 0x80000000)
         info = rig.wrist.drive_info()
         self.assertEqual(info[1]['counts_per_rev'], 4096)
         self.assertEqual(info[2]['rated_torque_mnm'], 250.0)
+        self.assertTrue(info[0]['current_mapped'] and info[0]['torque_demand_mapped'])
+        self.assertTrue(info[0]['drive_targets_mapped'] and info[0]['torque_offset_mapped'])
+        # The motor model the puck stores, in SI units.
+        p = rig.plant.p
+        self.assertAlmostEqual(info[0]['resistance_ohm'], p.winding_resistance, places=6)
+        self.assertAlmostEqual(info[0]['inductance_mh'], p.inductance_mh, places=6)
+        self.assertAlmostEqual(info[0]['rotor_inertia_kgm2'], p.arr('rotor_inertia')[0], delta=1e-9)
+        self.assertEqual(info[0]['gains']['kp'], p.drive_kp)
+        self.assertAlmostEqual(info[0]['gains']['kv'], p.drive_kv, delta=1e-9)
         rig.close()
 
     def test_unmappable_current_falls_back_to_position_only(self):
         rig = Rig(p4_sim.SimParams(current_mappable=False)).active()
         s = rig.run(p4wrist.hold((0, 0, 0), KP, KD), 0.2)
-        self.assertEqual(rig.bus.pucks[0].od[(0x1A00, 0)], 1)
+        self.assertEqual(rig.bus.pucks[0].od[(0x1A00, 1)], 0x60640020)
+        self.assertEqual(rig.bus.pucks[0].od[(0x1A00, 2)], 0x60740010)   # demand still mapped
         self.assertTrue(all(math.isnan(x) for x in s.tau_meas))
+        self.assertTrue(all(math.isfinite(x) for x in s.tau_demand))
         self.assertEqual(s.wrist_state, p4wrist.STATE_ACTIVE)
         rig.close()
 
@@ -346,3 +361,107 @@ class SafetyTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def drive_command(q, torque=(0.0, 0.0, 0.0)):
+    cmd = p4wrist.Command()
+    for j in range(3):
+        cmd.joint[j] = p4wrist.joint_command(position=q[j], torque=torque[j])
+    cmd.drive_loop = 1
+    return cmd
+
+
+def motor_stiffness(params, info, kv, kp):
+    """Motor stiffness (N m/rad) the emulated drive renders: torque per mille =
+    kv * kp * error in counts (p4_sim's unit assumption)."""
+    return kv * kp * params.counts_per_rev / (2 * math.pi) * info['rated_torque_mnm'] / 1e6
+
+
+class DriveLoopTest(unittest.TestCase):
+    """The drives' own position loops (CSP) rendering the joints."""
+
+    def setUp(self):
+        self.rig = Rig(frictionless()).active()
+        self.rig.run(p4wrist.hold((0, 0, 0), KP, KD), 0.2)
+
+    def tearDown(self):
+        self.rig.close()
+
+    def test_gains_are_written_and_restored(self):
+        w, bus = self.rig.wrist, self.rig.bus
+        w.set_drive_gains(1, kv=0.05, kp=80, kvff=100)
+        od = bus.pucks[1].od
+        self.assertEqual(od[(0x2382, 1)], 80)
+        self.assertEqual(od[(0x2382, 2)], 100)
+        self.assertAlmostEqual(p4_sim.bits_float(od[(0x2381, 1)]), 0.05, places=6)
+        self.assertEqual(w.sample().wrist_state, p4wrist.STATE_ACTIVE)   # written while running
+        w.stop()
+        self.assertEqual(od[(0x2382, 1)], self.rig.plant.p.drive_kp)    # restored at stop
+        self.assertAlmostEqual(p4_sim.bits_float(od[(0x2381, 1)]), self.rig.plant.p.drive_kv, places=6)
+
+    def test_enters_without_a_jump_and_renders_its_stiffness(self):
+        w, rig = self.rig.wrist, self.rig
+        kv, kp = 0.05, 80
+        for motor in range(3):
+            w.set_drive_gains(motor, kv=kv, kp=kp, kvff=100)
+        q0 = list(w.sample().q)
+        s = rig.run(drive_command(q0), 0.3)
+        self.assertEqual(s.drive_loop, 1)
+        self.assertTrue(all(m == 8 for m in s.mode_display))
+        self.assertEqual(list(s.joint_mode), [p4wrist.MODE_DRIVE] * 3)
+        np.testing.assert_allclose(list(s.q), q0, atol=2e-3)              # bumpless
+        self.assertTrue(all(math.isnan(x) for x in s.tau_cmd))           # the host commands no torque
+        # A feedforward torque (the drives' torque offset) deflects FE by tau / K_FE,
+        # K_FE = N1^2 (k7 + k8) with each motor's k from its gains.
+        info = w.drive_info()
+        k_m = motor_stiffness(rig.plant.p, info[1], kv, kp)
+        k_fe = p4_sim.N1 ** 2 * 2 * k_m
+        w.read_log()
+        rig.run(drive_command(q0, torque=(0.0, 0.2, 0.0)), 1.0)
+        last = w.read_log()[0][-250:]                                    # the last 0.5 s
+        self.assertAlmostEqual(last['q'][:, 1].mean() - q0[1], 0.2 / k_fe, delta=0.08 * 0.2 / k_fe)
+        self.assertAlmostEqual(last['q'][:, 2].mean(), q0[2], delta=0.05 * 0.2 / k_fe)  # no UR coupling
+        # At rest the spring cancels the offset: the drives' mean demand is ~0
+        # (a count of error is ~1 mN m per motor, so the loop chatters about it).
+        self.assertAlmostEqual(last['tau_demand'][:, 1].mean(), 0.0, delta=0.03)
+        # The setpoint moves the joint; then back to the host loop without a jump.
+        target = list(q0)
+        target[1] += 0.1
+        s = rig.run(drive_command(target), 1.0)
+        self.assertAlmostEqual(s.q[1], target[1], delta=3e-3)
+        s = rig.run(p4wrist.hold(target, KP, KD), 0.4)
+        self.assertEqual(s.drive_loop, 0)
+        self.assertTrue(all(m == 10 for m in s.mode_display))
+        self.assertAlmostEqual(s.q[1], target[1], delta=3e-3)
+
+    def test_supervision_still_brakes_in_the_drive_loop(self):
+        w, rig = self.rig.wrist, self.rig
+        for motor in range(3):
+            w.set_drive_gains(motor, kv=0.05, kp=80, kvff=100)
+        rig.run(drive_command(list(w.sample().q)), 0.3)
+        w.step(int(0.15 / 0.002))   # host goes quiet
+        s = w.sample()
+        self.assertEqual(p4wrist.FAULT_NAMES[s.fault], 'host timeout')
+        self.assertEqual(s.drive_loop, 0)
+        self.assertEqual(rig.bus.pucks[0].ramp_mode, p4_sim.DRIVE_BRAKE)
+
+    def test_refused_without_position_targets(self):
+        rig = Rig(frictionless(targets_mappable=False)).active()
+        rig.run(p4wrist.hold((0, 0, 0), KP, KD), 0.1)
+        s = rig.run(drive_command((0, 0, 0)), 0.05)
+        self.assertEqual(p4wrist.FAULT_NAMES[s.fault], 'drive loop')
+        rig.close()
+
+
+class FastLoopTest(unittest.TestCase):
+    def test_runs_at_1khz(self):
+        config = p4wrist.default_config()
+        config.period_s = 0.001
+        config.max_joint_velocity = p4wrist.D3(20.0, 20.0, 20.0)
+        rig = Rig(frictionless(), config=config).active()
+        self.assertEqual(rig.bus.pucks[0].od[(0x1006, 0)], 1000)
+        self.assertEqual(rig.bus.pucks[0].od[(0x60C2, 1)], 1)
+        s = rig.run(p4wrist.hold((0.1, 0, 0), KP, KD), 1.0)
+        self.assertAlmostEqual(s.q[0], 0.1, delta=2e-3)
+        self.assertAlmostEqual(s.time, 1.0 + rig.wrist.sample().time - s.time, delta=0.5)
+        rig.close()
