@@ -8,3 +8,4 @@ __pycache__/
 # data/<experiment>/<timestamp>/ are kept. 1 kHz runs are tens of MB each, so
 # consider archiving raw data outside git if the repository grows.
 data/*/*_sim/
+p4wrist/build/
